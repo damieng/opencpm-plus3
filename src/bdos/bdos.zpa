@@ -1,0 +1,4158 @@
+; ==========================================================================
+; CP/M BDOS — Z80-native Basic Disk Operating System
+; ==========================================================================
+;
+; @extern setup_fcb
+; @param  %fcb:u16  de
+; @out    ix
+; @clobbers af,bc,hl
+; @end
+;
+; @extern writeback_fcb
+; @clobbers af,bc,de,hl
+; @end
+;
+; @extern read_user_byte
+; @param  %addr:u16 de
+; @out    a
+; @clobbers bc
+; @end
+;
+; @extern write_user_byte
+; @param  %byte:u8  a
+; @param  %addr:u16 de
+; @clobbers bc
+; @end
+;
+; @extern copy_from_user
+; @param  %src:u16  hl
+; @param  %dst:u16  de
+; @param  %count:u16 bc
+; @clobbers af,bc
+; @end
+;
+; @extern copy_to_user
+; @param  %src:u16  hl
+; @param  %dst:u16  de
+; @param  %count:u16 bc
+; @clobbers af,bc
+; @end
+;
+; @extern copy_record_to_tpa
+; @param  %src:u16  hl
+; @param  %dst:u16  de
+; @clobbers af,bc,de,hl
+; @end
+;
+; @extern copy_record_from_tpa
+; @param  %src:u16  hl
+; @param  %dst:u16  de
+; @clobbers af,bc,de,hl
+; @end
+;
+; Implements the CP/M 2.2 BDOS API in native Z80 assembly.
+; Called via JP at address 0005h.
+;
+; Key functions for a usable system:
+;   Console: F0-F2, F6, F9-F12 (already working)
+;   Disk:    F13-F14, F17-F18, F20, F22, F24-F27, F31-F32
+;   File:    F15-F16, F19-F21, F22, F33-F36
+;
+; CP/M file system basics:
+;   - Directory: 32-byte entries (extents) at start of data area
+;   - Each extent: user, name[8], type[3], EX, S1, S2, RC, alloc[16]
+;   - Block allocation tracked via bitmap (ALV)
+;   - Files span multiple extents if > 16 blocks
+;   - Sequential I/O via FCB fields: CR (current record), EX (extent)
+;
+; ==========================================================================
+
+; BDOS stack and saved_sp are in common memory (common.asm).
+; The common stub switches to bdos_stack before calling bdos_entry.
+
+rdbuf_ptr:  dw 0               ; Buffer pointer for F10
+
+; --- BDOS state ---
+bdos_dma:   dw 0x0080          ; Current DMA address (default 0080h)
+cur_disk:   db 0               ; Current default disk (0=A:) — tracks the
+                               ; drive letter visible at the CCP prompt.
+                               ; File functions that take an FCB with an
+                               ; explicit drive override (e.g. A:FILE.COM)
+                               ; may retarget cur_disk briefly, so bdos_ret
+                               ; restores it from saved_disk on exit. Only
+                               ; fn 13 (Reset) and fn 14 (Select Disk) may
+                               ; change it permanently — they update both.
+saved_disk: db 0               ; User's default drive, restored by bdos_ret
+cur_user:   db 0               ; Current user number (0-15)
+iobyte:     db 0               ; IOBYTE (F7/F8)
+login_vec:  dw 0               ; Login vector (bit N = drive N logged in)
+ro_vec:     dw 0               ; Read-only vector
+error_mode: db 0               ; F45: BDOS error mode
+return_code: dw 0              ; F108: program return code
+con_mode:   dw 0               ; F109: console mode word
+out_delim:  db '$'             ; F110: output delimiter (default '$')
+; Date/time fields are in the SCB (common.asm): scb_date, scb_minute, scb_sec
+
+; Directory search state
+search_drv: db 0               ; Drive being searched
+search_pos: dw 0               ; Next directory entry to examine
+search_fcb: dw 0               ; FCB being searched for
+last_dir_sec: db 0xFF          ; Directory sector of last read_dir_entry (0xFF=invalid)
+
+; Cached DPB values for current disk (avoid repeated pointer chasing)
+cached_spt: dw 0               ; Sectors per track
+cached_bsh: db 0               ; Block shift
+cached_blm: db 0               ; Block mask
+cached_dsm: dw 0               ; Max block number
+cached_drm: dw 0               ; Max directory entry
+cached_off: dw 0               ; Reserved track offset
+cached_dpb: dw 0               ; Pointer to DPB
+cached_alv: dw 0               ; Pointer to ALV
+cached_csv: dw 0               ; Pointer to CSV
+
+
+; ==========================================================================
+; @proc bdos_warm_init
+; @clobbers af,bc,de,hl
+; @end
+; bdos_warm_init — Called by BIOS warm_boot to reset BDOS state
+;   Resets DMA, clears R/O vector, rebuilds ALV from directory.
+;   Must be called from system mode (bank 4 at 0000h).
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+bdos_warm_init:
+    ld hl, 0x0080
+    ld (bdos_dma), hl
+    ld hl, 0
+    ld (ro_vec), hl
+    call build_alv
+    ret
+
+; ==========================================================================
+; BDOS entry point
+; ==========================================================================
+
+bdos_entry:
+    ; SP is already set to bdos_stack by the common stub (bdos_stub).
+    ; The common stub also saved the user's SP in saved_sp.
+    push bc                    ; Save function and parameter
+    push de
+
+    ld a, c
+    ; --- Dispatch ---
+    cp 0
+    jp z, bf_f00
+    cp 1
+    jp z, bf_f01
+    cp 2
+    jp z, bf_f02
+    cp 3
+    jp z, bf_f03
+    cp 4
+    jp z, bf_f04
+    cp 5
+    jp z, bf_f05
+    cp 6
+    jp z, bf_f06
+    cp 7
+    jp z, bf_f07
+    cp 8
+    jp z, bf_f08
+    cp 9
+    jp z, bf_f09
+    cp 10
+    jp z, bf_f10
+    cp 11
+    jp z, bf_f11
+    cp 12
+    jp z, bf_f12
+    cp 13
+    jp z, bf_f13
+    cp 14
+    jp z, bf_f14
+    cp 15
+    jp z, bf_f15
+    cp 16
+    jp z, bf_f16
+    cp 17
+    jp z, bf_f17
+    cp 18
+    jp z, bf_f18
+    cp 19
+    jp z, bf_f19
+    cp 20
+    jp z, bf_f20
+    cp 21
+    jp z, bf_f21
+    cp 22
+    jp z, bf_f22
+    cp 23
+    jp z, bf_f23
+    cp 24
+    jp z, bf_f24
+    cp 25
+    jp z, bf_f25
+    cp 26
+    jp z, bf_f26
+    cp 27
+    jp z, bf_f27
+    cp 28
+    jp z, bf_f28
+    cp 29
+    jp z, bf_f29
+    cp 30
+    jp z, bf_f30
+    cp 31
+    jp z, bf_f31
+    cp 32
+    jp z, bf_f32
+    cp 33
+    jp z, bf_f33
+    cp 34
+    jp z, bf_f34
+    cp 35
+    jp z, bf_f35
+    cp 36
+    jp z, bf_f36
+    cp 37
+    jp z, bf_f37
+    cp 40
+    jp z, bf_f40
+    cp 44
+    jp z, bf_f44
+    cp 45
+    jp z, bf_f45
+    cp 46
+    jp z, bf_f46
+    cp 47
+    jp z, bf_f47
+    cp 48
+    jp z, bf_f48
+    cp 49
+    jp z, bf_f49
+    cp 50
+    jp z, bf_f50
+    cp 98
+    jp z, bf_f98
+    cp 99
+    jp z, bf_f99
+    cp 100
+    jp z, bf_f100
+    cp 101
+    jp z, bf_f101
+    cp 102
+    jp z, bf_f102
+    cp 103
+    jp z, bf_f103
+    cp 104
+    jp z, bf_f104
+    cp 105
+    jp z, bf_f105
+    cp 106
+    jp z, bf_f106
+    cp 107
+    jp z, bf_f107
+    cp 108
+    jp z, bf_f108
+    cp 109
+    jp z, bf_f109
+    cp 110
+    jp z, bf_f110
+    cp 111
+    jp z, bf_f111
+    cp 112
+    jp z, bf_f112
+
+    ; Unknown function
+    pop de
+    pop bc
+    ld hl, 0
+    ld a, l
+    jp bdos_ret
+
+; @proc bdos_ret
+; @out   hl
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bdos_ret:
+    ; Return to common stub (bdos_stub).
+    ; The CALL from bdos_stub pushed its return address at bdos_stack - 2.
+    ; Reset SP to that point regardless of what BDOS functions pushed/popped.
+    ;
+    ; Restore cur_disk from saved_disk: file functions may have temporarily
+    ; retargeted cur_disk based on an FCB drive override (A:FILE.COM etc.).
+    ; fn 13 (Reset) and fn 14 (Select Disk) update saved_disk too, so the
+    ; restore is a no-op when they legitimately changed the user default.
+    push af                    ; Preserve return value (A = result low byte)
+    ld a, (saved_disk)
+    ld (cur_disk), a
+    pop af
+    ld sp, bdos_stack - 2
+    ret
+
+
+; ==========================================================================
+; Console functions (F0-F12)
+; ==========================================================================
+
+; F0: System Reset (warm boot)
+; @proc bf_f00
+; @param %param:u16 de
+; @param %func:u8   c
+; @clobbers af,bc,de,hl
+; @end
+bf_f00:
+    pop de
+    pop bc
+    jp fn_wboot
+
+; @proc bf_f01
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f01:
+    pop de
+    pop bc
+    call con_in
+    push af                    ; lint: ignore — saving A return value, F is harmless
+    ld c, a
+    call con_out               ; Echo
+    pop af
+    jp bdos_ret
+
+; @proc bf_f02
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f02:
+    pop de
+    pop bc
+    ld c, e
+    call con_out
+    jp bdos_ret
+
+; F3: Auxiliary Input (reader)
+;   Out: A = character from aux device
+;   For now, returns 0x1A (Ctrl-Z / EOF) since we have no aux device
+; @proc bf_f03
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f03:
+    pop de
+    pop bc
+    ld a, 0x1A
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F4: Auxiliary Output (punch)
+;   In: E = character to send to aux device
+;   Silently discards (no aux hardware)
+; @proc bf_f04
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f04:
+    pop de
+    pop bc
+    xor a
+    jp bdos_ret
+
+; F5: List Output (printer)
+;   In: E = character to send to printer
+;   Silently discards (no printer hardware)
+; @proc bf_f05
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f05:
+    pop de
+    pop bc
+    xor a
+    jp bdos_ret
+
+; @proc bf_f06
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f06:
+    pop de
+    pop bc
+    ld a, e
+    cp 0xFF
+    jp z, .input
+    cp 0xFE
+    jp z, .status
+    ld c, e
+    call con_out
+    jp bdos_ret
+.input:
+    call con_status
+    or a
+    jp z, .none
+    call con_in
+    jp bdos_ret
+.none:
+    xor a
+    jp bdos_ret
+.status:
+    call con_status
+    jp bdos_ret
+
+; F7: Get IOBYTE
+; @proc bf_f07
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f07:
+    pop de
+    pop bc
+    ld a, (iobyte)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F8: Set IOBYTE
+;   In: E = new IOBYTE value
+; @proc bf_f08
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f08:
+    pop de
+    pop bc
+    ld a, e
+    ld (iobyte), a
+    jp bdos_ret
+
+; @proc bf_f09
+; @param %str:u16   de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f09:
+    pop de
+    pop bc
+.ploop:
+    call read_user_byte(de) preserving %func        ; A = byte at (DE) in TPA
+    cp '$'
+    jp z, bdos_ret
+    ld c, a
+    push de
+    call con_out
+    pop de
+    inc de
+    jp .ploop
+
+; @proc bf_f10
+; @param %buf:u16   de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f10:
+    pop de
+    pop bc
+    ld (rdbuf_ptr), de
+    call read_user_byte(de) preserving %func    ; A = max chars from buffer[0] in TPA (DE = buf addr)
+    ld b, a
+    ld c, 0                    ; C = count
+.rd_loop:
+    push bc
+    call con_in
+    pop bc
+    cp 0x0D
+    jp z, .rd_done
+    cp 0x08
+    jp z, .rd_bs
+    cp 0x7F
+    jp z, .rd_bs
+    cp 0x03
+    jp z, .rd_ctlc
+    cp 0x20
+    jp c, .rd_loop
+    push af
+    ld a, c
+    cp b
+    jp nc, .rd_full
+    pop af
+    push bc
+    ld hl, (rdbuf_ptr)
+    ld e, c
+    ld d, 0
+    add hl, de
+    inc hl
+    inc hl
+    ex de, hl                  ; DE = target address in TPA
+    call write_user_byte(a, de) preserving %func ; Write A to user buffer
+    pop bc
+    inc c
+    push bc
+    ld c, a
+    call con_out
+    pop bc
+    jp .rd_loop
+.rd_full:
+    pop af
+    jp .rd_loop
+.rd_bs:
+    ld a, c
+    or a
+    jp z, .rd_loop
+    dec c
+    push bc
+    ld c, 0x08
+    call con_out
+    ld c, ' '
+    call con_out
+    ld c, 0x08
+    call con_out
+    pop bc
+    jp .rd_loop
+.rd_ctlc:
+    push bc
+    ld c, '^'
+    call con_out
+    ld c, 'C'
+    call con_out
+    pop bc
+    jp fn_wboot
+.rd_done:
+    ld hl, (rdbuf_ptr)
+    inc hl
+    ex de, hl                  ; DE = &buffer[1] in TPA
+    ld a, c
+    call write_user_byte(a, de) preserving %func ; Write char count to TPA
+    push bc                    ; lint: ignore — BC is garbage but never used after pop
+    ld c, 0x0D
+    call con_out
+    ld c, 0x0A
+    call con_out
+    pop bc
+    jp bdos_ret
+
+; @proc bf_f11
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f11:
+    pop de
+    pop bc
+    call con_status
+    jp bdos_ret
+
+; @proc bf_f12
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f12:
+    pop de
+    pop bc
+    ld hl, 0x0031              ; CP/M 3.1, H=0 (CP/M system type, not MP/M)
+    ld a, l
+    jp bdos_ret
+
+
+; ==========================================================================
+; Disk management (F13-F14, F24-F27, F31-F32, F37)
+; ==========================================================================
+
+; F13: Reset disk system
+; F13: Reset Disk System
+;   Resets cur_disk, login_vec, ro_vec, bdos_dma per CP/M spec.
+;   Re-logins drive A immediately so DPB cache and ALV are valid.
+; @proc bf_f13
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f13:
+    pop de
+    pop bc
+    xor a
+    ld (cur_disk), a
+    ld (saved_disk), a         ; Reset makes A: the new user default
+    ld hl, 0
+    ld (login_vec), hl
+    ld (ro_vec), hl
+    ld hl, 0x0080
+    ld (bdos_dma), hl
+    ; Re-login drive A: caches DPH/DPB/ALV pointers and rebuilds ALV
+    call select_drive
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+; F14: Select disk (E = drive number)
+; @proc bf_f14
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f14:
+    ; Select Disk is intentionally lightweight — we only update cur_disk
+    ; and saved_disk, we do NOT call select_drive here. Doing a seek +
+    ; READ ID + ALV rebuild just because the user typed "B:" at the prompt
+    ; surprises the user and matches +3DOS's behaviour (CP/M Plus also
+    ; treats SELDSK at the BIOS as a deferred first-login hint). The next
+    ; file op (fn 15, 17, 19, etc.) will call select_drive and pick up
+    ; the DPH/DPB/ALV for the new drive then.
+    pop de
+    pop bc
+    ld a, e
+    ld (cur_disk), a
+    ld (saved_disk), a
+    ld hl, 0                   ; Return 0 = OK. Drive validity is checked
+    ld a, l                    ; on the first file op, not here.
+    jp bdos_ret
+
+; F24: Return login vector
+; @proc bf_f24
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f24:
+    pop de
+    pop bc
+    ld hl, (login_vec)
+    ld a, l
+    jp bdos_ret
+
+; F25: Return current disk
+; @proc bf_f25
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f25:
+    pop de
+    pop bc
+    ld a, (cur_disk)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F26: Set DMA address
+; @proc bf_f26
+; @param %dma:u16   de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f26:
+    pop de
+    pop bc
+    ld (bdos_dma), de
+    jp bdos_ret
+
+; F27: Get allocation vector
+; @proc bf_f27
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f27:
+    pop de
+    pop bc
+    ld hl, (cached_alv)
+    ld a, l
+    jp bdos_ret
+
+; F28: Write Protect Disk
+;   Sets the current disk read-only by setting its bit in ro_vec.
+;   In:  nothing (uses cur_disk)
+;   Out: nothing
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f28
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f28:
+    pop de
+    pop bc
+    ld a, (cur_disk)
+    ld b, a
+    ld de, 1
+    inc b
+.shift:
+    dec b
+    jp z, .done
+    sla e
+    rl d
+    jp .shift
+.done:
+    ld hl, (ro_vec)
+    ld a, l
+    or e
+    ld l, a
+    ld a, h
+    or d
+    ld h, a
+    ld (ro_vec), hl
+    jp bdos_ret
+
+; F29: Get read-only vector
+; @proc bf_f29
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f29:
+    pop de
+    pop bc
+    ld hl, (ro_vec)
+    ld a, l
+    jp bdos_ret
+
+; F30: Set File Attributes
+;   In:  DE = FCB with attribute bits set in filename bytes 9-11 (bit 7)
+;   Out: HL = 0 (OK), 0xFF (not found)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f30
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f30:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf
+
+    ; Select drive
+    ld a, (ix + 0)
+    or a
+    jp nz, .f30_drv
+    ld a, (cur_disk)
+    inc a
+.f30_drv:
+    dec a
+    ld (cur_disk), a
+    call select_drive
+
+    ; Scan directory for matching entries
+    ld de, 0
+    ld bc, 0                   ; B = found count, C = don't-care
+.f30_scan:
+    push de
+    push bc
+    call read_dir_entry
+    pop bc
+    pop de
+    jp c, .f30_done
+
+    ; Match name (bytes 1-8, ignoring attribute bits)
+    push de
+    push bc
+    push hl
+    push ix
+    pop de                     ; DE = fcb_buf
+    ; Compare bytes 1-8 (name) with bit 7 masked
+    ld c, 8
+    inc hl                     ; Skip user byte in dir entry
+    inc de                     ; Skip drive byte in FCB
+.f30_cmp_name:
+    ld a, (de)
+    and 0x7F
+    ld b, a
+    ld a, (hl)
+    and 0x7F
+    cp b
+    jr nz, .f30_no_match
+    inc hl
+    inc de
+    dec c
+    jr nz, .f30_cmp_name
+
+    ; Compare bytes 9-11 (type) with bit 7 masked
+    ld c, 3
+.f30_cmp_type:
+    ld a, (de)
+    and 0x7F
+    ld b, a
+    ld a, (hl)
+    and 0x7F
+    cp b
+    jr nz, .f30_no_match
+    inc hl
+    inc de
+    dec c
+    jr nz, .f30_cmp_type
+
+    ; Match — update attribute bits (bytes 9-11) in directory entry
+    pop hl                     ; HL = dir entry base
+    push hl
+    ld de, 9                   ; Offset to first type byte (T1)
+    add hl, de                 ; HL = &entry[9]
+    push ix
+    pop de
+    ld a, 9
+    add a, e
+    ld e, a                    ; DE = &fcb_buf[9]
+    ; Copy attribute bits: for each of 3 bytes, replace bit 7
+    ld c, 3
+.f30_set_attr:
+    ld a, (de)                 ; FCB byte (with desired attribute bit)
+    and 0x80                   ; Keep only attribute bit
+    ld b, a
+    ld a, (hl)                 ; Directory byte
+    and 0x7F                   ; Clear old attribute bit
+    or b                       ; Set new attribute bit
+    ld (hl), a
+    inc hl
+    inc de
+    dec c
+    jr nz, .f30_set_attr
+
+    call write_dir_entry
+
+    pop hl
+    pop bc
+    pop de
+    inc b                      ; Found count++
+    jr .f30_next
+
+.f30_no_match:
+    pop hl
+    pop bc
+    pop de
+.f30_next:
+    inc de
+    jp .f30_scan
+
+.f30_done:
+    ld a, b
+    or a
+    jp z, .f30_not_found
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+.f30_not_found:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F31: Get DPB address
+; @proc bf_f31
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f31:
+    pop de
+    pop bc
+    ld hl, (cached_dpb)
+    ld a, l
+    jp bdos_ret
+
+; F32: Get/Set user code
+; @proc bf_f32
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f32:
+    pop de
+    pop bc
+    ld a, e
+    cp 0xFF
+    jp z, .get
+    and 0x0F
+    ld (cur_user), a
+    jp bdos_ret
+.get:
+    ld a, (cur_user)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F37: Reset drive (DE = drive vector)
+; @proc bf_f37
+; @param %drives:u16 de
+; @param %func:u8    c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+bf_f37:
+    pop de
+    pop bc
+    ; Clear login bits for specified drives
+    ld hl, (login_vec)
+    ld a, e
+    cpl
+    and l
+    ld l, a
+    ld a, d
+    cpl
+    and h
+    ld h, a
+    ld (login_vec), hl
+    jp bdos_ret
+
+
+; ==========================================================================
+; @proc select_drive
+; @clobbers af,bc,de,hl
+; @end
+; Internal: select_drive — Log in a drive, cache its DPB parameters
+;   In:  cur_disk = drive number
+;   Out: cached_* fields populated
+;   Clobbers: AF, BC, DE, HL
+;
+; IX is preserved across this call (we save/restore it ourselves) so
+; BDOS file functions that hold IX = fcb_buf don't have to.
+; ==========================================================================
+select_drive:
+    push ix                    ; fdc_login (via BIOS) clobbers IX
+    call .select_body
+    pop ix
+    ret
+
+.select_body:
+    ; Call BIOS to select disk
+    ld a, (cur_disk)
+    ld c, a
+    ld e, 0                    ; E=0: not logged in yet
+    ; Check if already logged in
+    ld hl, (login_vec)
+    ld b, a
+    inc b
+.shift:
+    srl h
+    rr l
+    djnz .shift
+    bit 0, l
+    jp z, .do_login
+    ld e, 1                    ; Already logged in
+.do_login:
+    ld a, (cur_disk)
+    ld c, a
+    push de
+    call sel_disk              ; BIOS: HL = DPH address (0 = error)
+    pop de
+    ld a, h
+    or l
+    ret z                      ; Invalid drive
+
+    ; On first login of this drive, probe the disc format so the XDPB
+    ; reflects what's actually inserted (Freeze=FF makes re-login a no-op).
+    ld a, e
+    or a
+    jr nz, .skip_login         ; E=1 → already logged in this session
+    push hl                    ; save DPH (fdc_login clobbers HL, IX)
+    call fdc_login
+    pop hl
+.skip_login:
+
+    ; Mark drive as logged in
+    ld a, (cur_disk)
+    ld b, a
+    ld de, 1
+    inc b
+.shift2:
+    dec b
+    jp z, .done_shift
+    sla e
+    rl d
+    jp .shift2
+.done_shift:
+    ld hl, (login_vec)
+    ld a, l
+    or e
+    ld l, a
+    ld a, h
+    or d
+    ld h, a
+    ld (login_vec), hl
+
+    ; DPH is at the address returned by BIOS sel_disk.  Reload C from
+    ; cur_disk because fdc_login (via bios) clobbers BC — without this,
+    ; sel_disk selects the wrong physical unit on the second call and
+    ; later reads go to drive 0 regardless of what the user chose.
+    ld a, (cur_disk)
+    ld c, a
+    call sel_disk              ; Get HL = DPH again
+    ld a, h
+    or l
+    ret z
+
+    ; DPH layout: XLT(2), scratch(6), DIRBUF(2), DPB(2), CSV(2), ALV(2)
+    push hl
+    ld de, 10                  ; Offset to DPB pointer
+    add hl, de
+    ld e, (hl)
+    inc hl
+    ld d, (hl)                 ; DE = DPB address
+    ld (cached_dpb), de
+
+    pop hl
+    push hl
+    ld de, 12                  ; Offset to CSV pointer
+    add hl, de
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ld (cached_csv), de
+
+    pop hl
+    ld de, 14                  ; Offset to ALV pointer
+    add hl, de
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ld (cached_alv), de
+
+    ; Cache DPB fields
+    ld hl, (cached_dpb)
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+    ld (cached_spt), de        ; SPT
+    ld a, (hl)
+    inc hl
+    ld (cached_bsh), a         ; BSH
+    ld a, (hl)
+    inc hl
+    ld (cached_blm), a         ; BLM
+    inc hl                     ; Skip EXM
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+    ld (cached_dsm), de        ; DSM
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    inc hl
+    ld (cached_drm), de        ; DRM
+    inc hl
+    inc hl                     ; Skip AL0, AL1
+    inc hl
+    inc hl                     ; Skip CKS
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ld (cached_off), de        ; OFF
+
+    ; Build allocation vector from directory if first login
+    ld a, e
+    or a                       ; Was E=0 on entry (first login)?
+    ; Actually we lost that info. For now, always rebuild ALV on login.
+    call build_alv
+
+    ret
+
+
+; ==========================================================================
+; @proc build_alv
+; @clobbers af,bc,de,hl,ix
+; @end
+; Internal: build_alv — Build allocation vector from directory
+;   Scans all directory entries, marks used blocks in ALV.
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+build_alv:
+    ; Invalidate directory sector cache
+    ld a, 0xFF
+    ld (last_dir_sec), a
+    ; Clear ALV
+    ld hl, (cached_alv)
+    ld a, (cached_dsm)
+    srl a
+    srl a
+    srl a
+    inc a                      ; Bytes needed: (DSM/8)+1
+    ld b, a
+    xor a
+.clr:
+    ld (hl), a
+    inc hl
+    djnz .clr
+
+    ; Mark directory blocks as used (AL0/AL1 from DPB)
+    ld hl, (cached_dpb)
+    ld de, 9                   ; Offset to AL0
+    add hl, de
+    ld a, (hl)                 ; AL0
+    ld b, a
+    inc hl
+    ld a, (hl)                 ; AL1
+    ld c, a
+    ; AL0 bits 7-0 correspond to blocks 0-7
+    ; AL1 bits 7-0 correspond to blocks 8-15
+    ld d, 0                    ; Block counter
+.al_loop:
+    rlc b                      ; Rotate AL0 left, bit 7 → carry
+    jp nc, .al_skip0
+    ld a, d
+    call set_alloc_bit
+.al_skip0:
+    inc d
+    ld a, d
+    cp 8
+    jp c, .al_loop
+
+.al1_loop:
+    rlc c
+    jp nc, .al_skip1
+    ld a, d
+    call set_alloc_bit
+.al_skip1:
+    inc d
+    ld a, d
+    cp 16
+    jp c, .al1_loop
+
+    ; Scan directory entries and mark their blocks
+    ld de, 0                   ; DE = directory entry index
+.dir_scan:
+    push de
+    call read_dir_entry        ; Read entry DE into dir_buf, HL = entry addr
+    pop de
+    jp c, .dir_done            ; Past end of directory
+
+    ; Check if entry is active (user != 0xE5)
+    ld a, (hl)
+    cp 0xE5
+    jp z, .dir_next
+
+    ; Mark allocation blocks as used
+    push de
+    push hl
+    ld de, 16                  ; Offset to allocation map in entry
+    add hl, de
+    ld b, 16                   ; 16 block numbers (single byte for DSM<256)
+.mark_blk:
+    ld a, (hl)
+    or a
+    jp z, .skip_blk            ; Block 0 in the map means unused slot
+    call set_alloc_bit
+.skip_blk:
+    inc hl
+    djnz .mark_blk
+    pop hl
+    pop de
+
+.dir_next:
+    inc de
+    ld hl, (cached_drm)
+    inc hl                     ; HL = DRM+1 = total entries
+    or a                       ; lint: ignore — clear carry for sbc, A value irrelevant
+    sbc hl, de
+    jp nz, .dir_scan
+
+.dir_done:
+    ret
+
+
+; ==========================================================================
+; Internal: Allocation vector operations
+; ==========================================================================
+
+; @proc set_alloc_bit
+; @param %block:u8 a
+; @clobbers af
+; @end
+; set_alloc_bit — Mark block A as used in ALV
+;   In: A = block number
+;   Clobbers: AF
+set_alloc_bit:
+    push bc
+    push de
+    push hl
+    ld c, a                    ; C = block number
+    ; Byte index = block / 8
+    srl a
+    srl a
+    srl a
+    ld e, a
+    ld d, 0
+    ld hl, (cached_alv)
+    add hl, de                 ; HL = &ALV[block/8]
+    ; Bit mask: bit 7 - (block & 7)  (MSB first in CP/M ALV)
+    ld a, c
+    and 0x07
+    ld b, a
+    ld a, 0x80
+    jr z, .done
+.shr:
+    srl a
+    djnz .shr
+.done:
+    or (hl)                    ; Set the bit
+    ld (hl), a
+    pop hl
+    pop de
+    pop bc
+    ret
+
+
+; @proc clear_alloc_bit
+; @param %block:u8 a
+; @clobbers af,hl
+; @end
+; clear_alloc_bit — Mark block A as free in ALV
+;   In: A = block number
+;   Clobbers: AF, HL
+clear_alloc_bit:
+    push bc
+    push de
+    ld c, a
+    srl a
+    srl a
+    srl a
+    ld e, a
+    ld d, 0
+    ld hl, (cached_alv)
+    add hl, de
+    ld a, c
+    and 0x07
+    ld b, a
+    ld a, 0x80
+    jp z, .done
+.shr:
+    srl a
+    djnz .shr
+.done:
+    cpl                        ; Invert: 0 bit to clear, 1s to keep
+    and (hl)
+    ld (hl), a
+    pop de
+    pop bc
+    ret
+
+
+; @proc find_free_block
+; @out   a
+; @clobbers bc,de,hl
+; @end
+; find_free_block — Find first free block in ALV
+;   Out: A = block number (0 if none free), carry set if disk full
+;   Clobbers: BC, DE, HL
+find_free_block:
+    ld hl, (cached_alv)
+    ld de, (cached_dsm)
+    inc de                     ; DE = total blocks
+    ld bc, 0                   ; BC = current block number
+.byte_loop:
+    ld a, (hl)
+    cp 0xFF                    ; All 8 blocks used?
+    jp nz, .check_bits
+    ; Skip 8 blocks
+    ld a, c
+    add a, 8
+    ld c, a
+    jp nc, .no_carry
+    inc b
+.no_carry:
+    inc hl
+    ; Check if past DSM
+    push hl
+    ld h, b
+    ld l, c
+    or a
+    sbc hl, de
+    pop hl
+    jp c, .byte_loop
+    scf                        ; Disk full
+    ret
+
+.check_bits:
+    ; A = ALV byte, some bits are 0 (free)
+    ld e, a
+    ld d, 0x80                 ; Bit mask
+.bit_loop:
+    ld a, e
+    and d
+    jp z, .found               ; Bit is 0 = block is free
+    srl d
+    inc bc
+    ; Check if past DSM
+    push hl
+    ld hl, (cached_dsm)
+    inc hl
+    or a
+    sbc hl, bc
+    pop hl
+    jp z, .full
+    jp .bit_loop
+
+.found:
+    ld a, c                    ; A = free block number
+    or a                       ; Clear carry
+    ret
+
+.full:
+    scf
+    ret
+
+
+; ==========================================================================
+; Internal: Directory operations
+; ==========================================================================
+
+; @proc read_dir_entry
+; @param %entry:u16 de
+; @out   hl
+; @clobbers af,bc
+; @end
+; read_dir_entry — Read directory sector containing entry N, return pointer
+;   In:  DE = directory entry number (0-based)
+;   Out: HL = pointer to 32-byte entry within dir sector buffer
+;        Carry set if entry beyond DRM
+;   Clobbers: AF, BC
+read_dir_entry:
+    ; Check bounds
+    push de
+    ld hl, (cached_drm)
+    inc hl
+    or a
+    sbc hl, de
+    pop de
+    jp z, .out_of_range
+    jp c, .out_of_range
+
+    ; Directory sector = entry / 4 (4 entries per 128-byte sector)
+    ; Offset within sector = (entry % 4) * 32
+    ld a, e                    ; Low byte of entry number (max 63 for us)
+    push af                    ; Save for offset calculation
+    srl a
+    srl a                      ; A = entry / 4 = directory sector number
+
+    ; Check if this sector is already cached in dirbuf
+    ld b, a                    ; B = sector number
+    ld a, (last_dir_sec)
+    cp b
+    jr z, .dir_cached          ; Same sector — skip disk read
+
+    ; Read this directory sector via BIOS
+    ld a, b
+    ld (last_dir_sec), a       ; Save sector number for write_dir_entry
+    call dir_sector_to_bios    ; Set BIOS track/sector
+
+    ; Save user DMA, then redirect to our internal directory buffer
+    ld hl, (bdos_dma)
+    push hl
+    ld bc, dirbuf
+    call set_dma
+
+    ; Read via BIOS
+    call disk_read
+    or a
+    jp nz, .read_error_dma
+
+    ; Restore user DMA
+    pop hl
+    ld (bdos_dma), hl
+
+.dir_cached:
+    pop af                     ; A = original entry number (from line 913)
+    and 0x03                   ; Entry within sector (0-3)
+    ; Multiply by 32
+    ld l, a
+    ld h, 0
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = (entry%4) * 32
+    ld de, dirbuf
+    add hl, de                 ; HL = &dirbuf[offset]
+    or a                       ; Clear carry
+    ret
+
+.out_of_range:
+    ; Reached before any pushes — stack is clean, just return with carry
+    scf
+    ret
+
+.read_error_dma:
+    pop hl                     ; saved bdos_dma
+    ld (bdos_dma), hl          ; Restore user DMA before returning
+    pop af                     ; entry-number af pushed at top of routine
+    scf
+    ret
+
+
+; @proc write_dir_entry
+; @clobbers af,bc,de,hl
+; @end
+; write_dir_entry — Write back the current directory sector
+;   Re-seeks to the directory sector saved by read_dir_entry.
+;   Clobbers: AF, BC, DE, HL
+write_dir_entry:
+    ld a, (last_dir_sec)       ; Re-establish correct track/sector
+    call dir_sector_to_bios
+    ld bc, dirbuf
+    call set_dma
+    call disk_write
+    ret
+
+
+; @proc dir_sector_to_bios
+; @param %sector:u8 a
+; @clobbers af,bc,de,hl
+; @end
+; dir_sector_to_bios — Set BIOS track/sector for directory sector N
+;   In: A = directory sector number (0-based within directory area)
+;   The directory starts at logical sector 0 of the first data track.
+;   Clobbers: AF, BC, DE, HL
+dir_sector_to_bios:
+    ; Directory sector N maps to:
+    ;   absolute_record = N (directory starts at record 0 of data area)
+    ;   track = absolute_record / SPT + OFF
+    ;   sector = absolute_record % SPT
+    ld l, a
+    ld h, 0                    ; HL = directory record number
+    ld de, (cached_off)
+    ; Track = OFF + record / SPT
+    ; Since SPT=36 and records are small, this is just track=OFF for early records
+    ld bc, (cached_spt)
+    call div_hl_bc             ; HL = quotient (track offset), DE = remainder (sector)
+    push de                    ; Save sector
+    ld de, (cached_off)
+    add hl, de                 ; HL = track
+    ld b, h
+    ld c, l
+    call set_trk               ; BIOS set track
+
+    pop bc                     ; BC = sector
+    call set_sec               ; BIOS set sector
+    ret
+
+
+; ==========================================================================
+; File functions (F15-F23, F33-F36, F40)
+; ==========================================================================
+
+; F17: Search First
+; @proc bf_f17
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f17:
+    pop de
+    pop bc
+    ; DE = FCB pointer in TPA — copy to fcb_buf for system-side access
+    call setup_fcb(de)         ; Copy 36 bytes from TPA to fcb_buf, IX = fcb_buf
+    ld de, fcb_buf
+    ld (search_fcb), de        ; Point search at system copy
+    ld hl, 0
+    ld (search_pos), hl        ; Start from entry 0
+
+    ; Make sure drive is selected
+    ld a, (de)                 ; FCB byte 0 from fcb_buf (common memory — OK)
+    or a
+    jp nz, .has_drive
+    ld a, (cur_disk)
+    inc a                      ; Convert to 1-based
+.has_drive:
+    dec a                      ; Back to 0-based
+    ld (search_drv), a
+    push af
+    ld (cur_disk), a           ; Temp select this drive
+    call select_drive
+    pop af
+
+    jp search_next_entry
+
+; F18: Search Next
+; @proc bf_f18
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f18:
+    pop de
+    pop bc
+    ; Continue from search_pos
+
+; @proc search_next_entry
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+search_next_entry:
+    ld de, (search_pos)
+.loop:
+    push de
+    call read_dir_entry        ; HL = entry, carry if past end
+    pop de
+    jp c, .not_found
+
+    ; Compare entry with search FCB
+    push de
+    push hl                    ; Save entry pointer
+    ld de, (search_fcb)
+    call match_fcb             ; Z = match
+    pop hl
+    pop de
+    jp z, .found
+
+    inc de
+    jp .loop
+
+.not_found:
+    ; Return 0xFF = not found
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.found:
+    ; Store position for Search Next
+    inc de
+    ld (search_pos), de
+    dec de
+
+    ; Copy the directory sector to the user's DMA area
+    ; The matching entry is at position (entry % 4) within the sector.
+    ; CP/M convention: copy 128-byte directory sector to DMA,
+    ; return A = index (0-3) of matching entry within it.
+    ld hl, dirbuf                  ; Source: common memory
+    ld de, (bdos_dma)              ; Dest: user DMA in TPA
+    ld bc, 128
+    call copy_to_user(hl, de, bc)  ; Inter-bank copy
+
+    ; Return index of match within sector
+    ld de, (search_pos)
+    dec de                     ; Back to the matched entry
+    ld a, e
+    and 0x03                   ; Index within 128-byte sector (0-3)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; @proc match_fcb
+; @param %entry:u16 hl
+; @param %fcb:u16   de
+; @out   zero
+; @clobbers af,bc
+; @end
+; match_fcb — Compare directory entry at HL with FCB at DE
+;   Compares user number and filename (bytes 0-12).
+;   '?' in the FCB matches any character.
+;   Out: Z = match, NZ = no match
+;   Clobbers: AF, BC
+match_fcb:
+    ; Byte 0 of directory entry = user number.  Valid values 0-15 are
+    ; real user areas; 0x10-0x1F are reserved for disc labels / timestamps
+    ; in CP/M 3; 0xE5 means "deleted"; anything else is garbage (e.g. a
+    ; never-written entry on a BFORMAT disc).  Only user 0-15 entries
+    ; should be considered for a normal directory match.
+    ld a, (hl)
+    cp 16
+    jp nc, .no_match           ; 16+ (labels, deleted, garbage) — skip
+
+    push hl
+    push de
+    ; Check user: if search FCB byte 0 is '?', match any user
+    ld a, (de)                 ; FCB byte 0 (drive code, not user for search)
+    ; For search, byte 0 is drive. User is matched against cur_user.
+    ld a, (cur_user)
+    ld c, a                    ; C = current user
+    ld a, (hl)                 ; Entry user
+    cp c
+    jp nz, .no_match_pop       ; Different user
+
+    ; Compare filename bytes 1-11 (8 name + 3 type)
+    inc hl
+    inc de
+    ld b, 11
+.cmp_loop:
+    ld a, (de)                 ; FCB char
+    cp '?'
+    jp z, .cmp_next            ; Wildcard matches anything
+    and 0x7F                   ; Mask off attribute bit from FCB
+    ld c, a
+    ld a, (hl)                 ; Directory char
+    and 0x7F                   ; Mask off attribute bit from directory
+    cp c
+    jp nz, .no_match_pop
+.cmp_next:
+    inc hl
+    inc de
+    djnz .cmp_loop
+
+    ; Match!
+    pop de
+    pop hl
+    xor a                      ; Set Z
+    ret
+
+.no_match_pop:
+    pop de
+    pop hl
+.no_match:
+    or 1                       ; Clear Z
+    ret
+
+
+; F15: Open File
+; @proc bf_f15
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f15:
+    pop de
+    pop bc
+    ; Copy FCB from TPA to fcb_buf
+    call setup_fcb(de)         ; IX = fcb_buf, DE preserved
+    ld de, fcb_buf
+    push de
+
+    ; Select drive from FCB
+    ld a, (de)                 ; fcb_buf[0] — common memory, OK
+    or a
+    jp nz, .has_drv
+    ld a, (cur_disk)
+    inc a
+.has_drv:
+    dec a
+    ld (cur_disk), a
+    call select_drive
+
+    ; Search for the file in the directory
+    pop de                     ; DE = fcb_buf
+    push de
+    ld (search_fcb), de
+    ld hl, 0
+    ld (search_pos), hl
+
+.search:
+    ld de, (search_pos)
+    push de
+    call read_dir_entry
+    pop de
+    jp c, .not_found
+
+    push de
+    push hl
+    ld de, (search_fcb)
+    call match_fcb
+    pop hl
+    pop de
+    jp z, .found
+
+    inc de
+    ld (search_pos), de
+    jp .search
+
+.not_found:
+    pop de
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.found:
+    ; Copy directory entry to fcb_buf
+    ; HL = directory entry, stack has fcb_buf pointer
+    pop de                     ; DE = fcb_buf
+    push de
+    push hl
+    ; Copy bytes 0-31 from directory to fcb_buf (except byte 0 = drive)
+    inc hl                     ; Skip user byte in directory
+    inc de                     ; Skip drive byte in fcb_buf
+    ld bc, 31
+    ldir                       ; directory → fcb_buf (both common/system — OK)
+    pop hl
+    pop de
+
+    ; Set CR = 0 (start of file)
+    push de
+    pop hl
+    ld de, 32
+    add hl, de
+    ld (hl), 0                 ; fcb_buf[32] = 0
+
+    ; Write modified FCB back to TPA
+    call writeback_fcb()
+
+    ld a, 0                    ; Success
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F16: Close File
+;   In:  DE = FCB (EX must reflect the extent being closed)
+;   Out: HL = 0 (OK)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f16
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f16:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+    call flush_deblock         ; Flush any pending write data
+    call close_dir_update
+    call writeback_fcb()
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; ------------------------------------------------------------------
+; @proc close_dir_update
+; @clobbers af,bc,de,hl
+; @end
+; close_dir_update — Find directory entry matching FCB and update it
+;   In:  IX = fcb_buf (with correct EX, RC, alloc map)
+;   Clobbers: AF, BC, DE, HL
+; ------------------------------------------------------------------
+close_dir_update:
+    ld de, 0
+.cl_scan:
+    push de
+    call read_dir_entry        ; HL = ptr to 32-byte entry, carry = past end
+    pop de
+    jp c, .cl_done
+
+    push de
+    push hl
+    ; Check user number
+    ld a, (hl)
+    cp 0xE5
+    jp z, .cl_skip
+    ld a, (cur_user)
+    ld c, a
+    ld a, (hl)
+    cp c
+    jp nz, .cl_skip
+    ; Check filename bytes 1-11 (strip attribute bits from directory)
+    push hl
+    inc hl                     ; HL = &entry[1]
+    push ix
+    pop de
+    inc de                     ; DE = &FCB[1]
+    ld b, 11
+.cl_name:
+    ld a, (hl)
+    and 0x7F
+    ld c, a
+    ld a, (de)
+    and 0x7F                   ; Mask FCB attribute bit too
+    cp c
+    jp nz, .cl_name_fail
+    inc hl
+    inc de
+    djnz .cl_name
+    pop hl                     ; HL = entry base (from push before inc hl)
+    ; Check EX (byte 12)
+    ld de, 12
+    add hl, de                 ; HL = &entry[12]
+    ld a, (hl)
+    ld c, a
+    ld a, (ix + 12)
+    cp c
+    jp nz, .cl_skip_from_ex    ; EX mismatch — keep scanning
+    ; Found the right entry — update RC and allocation map in-place
+    ; HL = &entry[12], stack: [de_outer, hl_outer]
+    ld de, 3
+    add hl, de                 ; HL = &entry[15] (RC)
+    ld a, (ix + 15)
+    ld (hl), a                 ; entry.RC = FCB.RC
+    inc hl                     ; HL = &entry[16]
+    ; Copy FCB allocation map → directory entry (straight copy per spec)
+    push ix
+    pop de                     ; DE = FCB base
+    push hl
+    ld bc, 16
+    ex de, hl
+    add hl, bc                 ; HL = &FCB[16]
+    ex de, hl                  ; DE = &FCB[16]
+    pop hl                     ; HL = &entry[16]
+    ex de, hl                  ; HL = &FCB[16], DE = &entry[16]
+    ld bc, 16
+    ldir                       ; FCB alloc → directory entry
+    call write_dir_entry
+    pop de                     ; Discard hl_outer
+    pop de                     ; Discard de_outer
+    ret
+
+.cl_name_fail:
+    pop hl                     ; Balance push hl before inc hl
+.cl_skip_from_ex:              ; Stack: [de_outer, hl_outer]
+.cl_skip:
+    pop hl                     ; Discard hl_outer
+    pop de                     ; Restore entry index
+    inc de
+    jp .cl_scan
+
+.cl_done:
+    ret
+
+
+; F19: Delete File
+;   In:  DE = FCB (filename may contain '?' wildcards in bytes 1-11)
+;   Out: HL = 0 (deleted ≥1 entry), 0xFF (not found)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f19
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f19:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Select drive from FCB
+    ld a, (ix + 0)
+    or a
+    jp z, .del_cur
+    dec a
+    ld (cur_disk), a
+    call select_drive
+.del_cur:
+
+    ld de, 0                   ; Directory entry index
+    ld b, 0                    ; B = found count
+.del_scan:
+    push de
+    push bc                    ; lint: ignore — only B matters, C is don't-care
+    call read_dir_entry        ; HL = entry, carry = past end
+    pop bc
+    pop de
+    jp c, .del_done
+
+    push de
+    push bc
+    push hl
+    ; Call match_fcb: HL = entry, DE = FCB (with wildcard support)
+    push ix
+    pop de
+    call match_fcb             ; Z = match, NZ = no match (clobbers AF, BC)
+    pop hl
+    pop bc
+    pop de
+    jp nz, .del_next
+
+    ; Match — free all blocks and mark entry as deleted
+    push de
+    push bc
+    push hl
+    ld de, 16
+    add hl, de                 ; HL = &entry[16] (allocation map)
+    ld b, 16
+.del_free:
+    ld a, (hl)
+    or a
+    jp z, .del_skip_blk
+    push hl
+    call clear_alloc_bit
+    pop hl
+.del_skip_blk:
+    inc hl
+    djnz .del_free
+    pop hl                     ; HL = entry base
+    ld (hl), 0xE5              ; Mark entry as deleted
+    call write_dir_entry
+    pop bc
+    pop de
+    inc b                      ; B = found count++
+
+.del_next:
+    inc de
+    jp .del_scan
+
+.del_done:
+    ld a, b
+    or a
+    jp z, .del_none
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+.del_none:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F20: Read Sequential
+; @proc bf_f20
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f20:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Get current position from FCB
+    ; CR (byte 32) = current record within extent (0-127)
+    ; EX (byte 12) = extent number
+    ; The absolute record = EX * 128 + CR
+    ; The block = allocation_map[record / records_per_block]
+    ; Where records_per_block = block_size / 128
+
+    push ix
+
+    ; Check if we've reached the end of this extent
+    ld a, (ix + 32)            ; CR
+    ld b, a
+    ld a, (ix + 15)            ; RC (record count in extent)
+    cp b
+    jp z, .next_extent         ; CR == RC → try next extent
+    jp c, .next_extent
+
+.do_read:
+    ; Calculate which block within extent contains this record
+    ; records_per_block = 2^BSH = 8 (for BSH=3, 1K blocks)
+    ; block_index = CR / records_per_block = CR >> BSH
+    ld a, (ix + 32)            ; CR
+    ld c, a                    ; Save CR
+    ld a, (cached_bsh)
+    ld b, a
+    ld a, c
+.shr_cr:
+    srl a
+    djnz .shr_cr               ; A = CR >> BSH = block index in extent
+
+    ; Get block number from allocation map (FCB bytes 16-31)
+    ld e, a
+    ld d, 0
+    push ix
+    pop hl
+    ld bc, 16
+    add hl, bc
+    add hl, de                 ; HL = &FCB[16 + block_index]
+    ld a, (hl)                 ; A = block number
+    or a
+    jp z, .eof                 ; Block 0 = no more data
+
+    ; Calculate absolute track/sector for this record
+    ; record_in_block = CR & BLM
+    push af                    ; Save block number
+    ld a, (ix + 32)            ; CR
+    ld b, a
+    ld a, (cached_blm)
+    and b                      ; A = record within block
+    ld c, a                    ; C = record in block
+    pop af                     ; A = block number
+
+    ; Absolute record = block * records_per_block + record_in_block
+    ; = block << BSH + record_in_block
+    ld l, a
+    ld h, 0                    ; HL = block number
+    ld a, (cached_bsh)
+    ld b, a
+.shl_blk:
+    add hl, hl
+    djnz .shl_blk              ; HL = block << BSH = block * records_per_block
+    ld b, 0
+    add hl, bc                 ; HL = absolute record in data area
+
+    ; Convert to track/sector
+    ld bc, (cached_spt)
+    call div_hl_bc             ; HL = track offset, DE = sector
+    push de
+    ld de, (cached_off)
+    add hl, de                 ; HL = absolute track
+    ld b, h
+    ld c, l
+    call set_trk
+
+    pop bc                     ; BC = sector
+    call set_sec
+
+    ; Set DMA to user's buffer
+    ld bc, (bdos_dma)
+    call set_dma
+
+    ; Read
+    call disk_read
+    or a
+    jp nz, .read_err
+
+    ; Advance CR
+    pop ix                     ; Restore FCB pointer
+    inc (ix + 32)              ; CR++
+
+    call writeback_fcb()
+    ld a, 0                    ; Success
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; ------------------------------------------------------------------
+; Open next extent when current extent is exhausted
+;   IX = FCB pointer. Increment EX, search directory for next extent.
+;   If found, copy allocation map to FCB, reset CR, continue reading.
+; ------------------------------------------------------------------
+.next_extent:
+    ; Increment extent number
+    ld a, (ix + 12)            ; EX (extent low)
+    inc a
+    ld (ix + 12), a
+
+    ; Reset CR to 0
+    ld (ix + 32), 0
+
+    ; Search directory for this extent
+    ; We need to find an entry with same name AND matching EX
+    pop ix                     ; Balance the push ix from entry
+    push ix
+
+    ; Save search state
+    ld hl, 0
+    ld (search_pos), hl
+
+    push ix
+    pop de                     ; DE = FCB
+    ld (search_fcb), de
+
+.next_ext_search:
+    ld de, (search_pos)
+    push de
+    call read_dir_entry
+    pop de
+    jp c, .eof                 ; Past end → real EOF
+
+    ; Check if entry matches: same user, same name, same EX
+    push de
+    push hl                    ; HL = directory entry
+    ; Compare user (byte 0)
+    ld a, (cur_user)
+    ld c, a
+    ld a, (hl)
+    cp 0xE5
+    jp z, .next_ext_skip
+    cp c
+    jp nz, .next_ext_skip
+
+    ; Compare name bytes 1-11
+    push hl
+    push ix
+    pop de                     ; DE = FCB
+    inc hl
+    inc de
+    ld b, 11
+.next_ext_cmp:
+    ld a, (de)
+    ld c, a
+    ld a, (hl)
+    and 0x7F
+    cp c
+    jp nz, .next_ext_cmp_fail
+    inc hl
+    inc de
+    djnz .next_ext_cmp
+    pop hl                     ; Clean push hl
+
+    ; Name matches — check extent number
+    push hl
+    ld de, 12
+    add hl, de                 ; HL = &entry[12] (EX)
+    ld a, (hl)
+    ld b, a                    ; B = entry EX
+    ld a, (ix + 12)            ; A = target EX
+    cp b
+    pop hl
+    jp nz, .next_ext_skip
+
+    ; Found the right extent! Copy allocation data to FCB
+    pop hl                     ; HL = directory entry
+    pop de                     ; DE = search pos
+    push ix
+    pop de                     ; DE = FCB
+    ; Copy bytes 12-31 from directory entry to FCB
+    push hl
+    ld bc, 12
+    add hl, bc                 ; HL = &entry[12]
+    push de
+    pop iy
+    ld de, 12
+    push iy
+    pop bc                     ; BC = FCB base? No...
+    ; Simpler: just copy fields manually
+    pop hl                     ; HL = directory entry start
+    push de                    ; Save FCB ptr
+    ; Copy RC (byte 15)
+    ld a, (ix + 12)            ; Keep our EX
+    push af
+    ld de, 15
+    add hl, de
+    ld a, (hl)                 ; Directory entry RC
+    pop bc                     ; B = our EX
+    pop de                     ; DE = FCB
+    push de
+    push hl
+    ld hl, 15
+    add hl, de                 ; HL = &FCB[15]
+    ld (hl), a                 ; FCB.RC = entry.RC
+    pop hl
+    pop de
+    ; Copy allocation map (bytes 16-31)
+    push de
+    push hl
+    ld hl, 16 - 15             ; Offset from current HL position
+    pop bc                     ; BC = old HL (entry+15)
+    push bc
+    pop hl
+    inc hl                     ; HL = &entry[16]
+    ld de, (search_fcb)
+    push de
+    pop iy
+    ld b, 16
+.copy_alloc:
+    ld a, (hl)
+    ld (iy + 16), a
+    inc hl
+    inc iy
+    djnz .copy_alloc
+    pop de
+
+    ; Now retry the read with the new extent data
+    pop ix                     ; IX = FCB
+    push ix
+    jp .do_read
+
+.next_ext_cmp_fail:
+    pop hl                     ; Clean push hl from name compare
+.next_ext_skip:
+    pop hl
+    pop de
+    inc de
+    ld (search_pos), de
+    jp .next_ext_search
+
+.eof:
+    pop ix
+    ld a, 1                    ; EOF / error
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.read_err:
+    pop ix
+    ld a, 0xFF
+    ld l, a
+    ld h, 0xFF
+    jp bdos_ret
+
+
+; F21: Write Sequential
+;   In:  DE = FCB
+;   Out: HL = 0 (OK), 1 (disk full), 0xFF (write error)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f21
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f21:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+bf_f21_core:
+    ; Entry point for F34 (Write Random) — IX = FCB, EX/CR already set.
+
+    ; If CR == 128 this extent is full — create a new extent first
+    ld a, (ix + 32)            ; CR
+    cp 128
+    jp z, .wseq_new_extent
+
+.wseq_do:
+    ; Compute block_index = CR >> BSH
+    ld a, (ix + 32)            ; CR
+    ld c, a
+    ld a, (cached_bsh)
+    ld b, a
+    ld a, c
+.wseq_shr:
+    srl a
+    djnz .wseq_shr             ; A = CR >> BSH = block_index in alloc map
+
+    ; Get block number from FCB: FCB[16 + block_index]
+    ld e, a
+    ld d, 0
+    push ix
+    pop hl
+    ld bc, 16
+    add hl, bc
+    add hl, de                 ; HL = &FCB[16 + block_index]
+    ld a, (hl)
+    or a
+    jp z, .wseq_alloc          ; Zero = unallocated, need a new block
+
+.wseq_have_block:
+    ; A = block number
+    push af                    ; Save block number
+    ; record_in_block = CR & BLM
+    ld a, (ix + 32)            ; CR
+    ld b, a
+    ld a, (cached_blm)
+    and b                      ; A = record_in_block
+    ld c, a
+    pop af                     ; A = block number
+
+    ; abs_record = (block << BSH) + record_in_block
+    ld l, a
+    ld h, 0
+    ld a, (cached_bsh)
+    ld b, a
+.wseq_shl:
+    add hl, hl
+    djnz .wseq_shl             ; HL = block << BSH
+    ld b, 0
+    add hl, bc                 ; HL = absolute record in data area
+
+    ; Convert to track and sector
+    ld bc, (cached_spt)
+    call div_hl_bc             ; HL = track_in_data, DE = sector
+    push de
+    ld de, (cached_off)
+    add hl, de
+    ld b, h
+    ld c, l
+    call set_trk
+    pop bc                     ; BC = sector
+    call set_sec
+
+    ; DMA = user's write buffer
+    ld bc, (bdos_dma)
+    call set_dma
+
+    ; Write the 128-byte record
+    ld c, 0                    ; Write type: normal
+    call disk_write
+    or a
+    jp nz, .wseq_error
+
+    ; RC = max(RC, CR+1): record count tracks how many records are in extent
+    ld a, (ix + 32)            ; CR (current, before increment)
+    inc a                      ; A = CR + 1
+    ld b, a
+    ld a, (ix + 15)            ; RC
+    cp b
+    jp nc, .wseq_no_rc         ; RC >= CR+1 already
+    ld (ix + 15), b            ; RC = CR + 1
+.wseq_no_rc:
+    inc (ix + 32)              ; CR++
+    call writeback_fcb()
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.wseq_alloc:
+    ; HL = &FCB[16 + block_index] — need to allocate a block here
+    push hl                    ; Save alloc slot pointer
+    call find_free_block       ; A = free block number, carry = disk full
+    pop hl
+    jp c, .wseq_full
+    push hl
+    push af
+    call set_alloc_bit         ; Mark block as used in ALV
+    pop af
+    pop hl
+    ld (hl), a                 ; Store block number in FCB alloc map
+    jp .wseq_have_block
+
+.wseq_full:
+    ld a, 1                    ; No disk space
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.wseq_error:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.wseq_new_extent:
+    ; CR == 128: current extent is full.
+    ; Must close the current extent (flush alloc map to directory).
+    call flush_deblock
+    call writeback_fcb()         ; Save FCB to TPA for close to read
+    call wseq_close_cur        ; Close current extent via directory update
+
+    ld de, 0                   ; Scan for a free (E5h) directory entry
+.wseq_ne_find:
+    push de
+    call read_dir_entry        ; HL = entry, carry = past end
+    pop de
+    jp c, .wseq_full
+
+    push de
+    ld a, (hl)
+    cp 0xE5
+    jp nz, .wseq_ne_next
+
+    ; Found a free directory entry — initialise it as new extent
+    push hl
+    ld b, 32
+.wseq_ne_zero:
+    ld (hl), 0
+    inc hl
+    djnz .wseq_ne_zero
+    pop hl                     ; HL = entry base
+
+    ; Set user
+    ld a, (cur_user)
+    ld (hl), a
+
+    ; Copy filename from FCB[1..11] → entry[1..11], masking attribute bits
+    inc hl                     ; HL = &entry[1]
+    push ix
+    pop de
+    inc de                     ; DE = &FCB[1]
+    ex de, hl                  ; HL = &FCB[1], DE = &entry[1]
+    ld b, 11
+.wseq_ne_copy:
+    ld a, (hl)
+    and 0x7F                   ; Strip attribute bit
+    ld (de), a
+    inc hl
+    inc de
+    djnz .wseq_ne_copy        ; After: DE = &entry[12], HL = &FCB[12]
+
+    ; Set new EX = old EX + 1 in both FCB and directory entry
+    ld a, (ix + 12)            ; Current FCB.EX
+    inc a
+    ld (ix + 12), a            ; FCB.EX = EX + 1
+    ld (de), a                 ; entry.EX = EX + 1 (DE = &entry[12])
+    ; Bytes 13-31 already zero: S1=0, S2=0, RC=0, alloc[0..15]=0
+
+    call write_dir_entry
+
+    ; Reset FCB for new extent
+    ld (ix + 32), 0            ; CR = 0
+    ld (ix + 15), 0            ; RC = 0
+    push ix
+    pop hl
+    ld de, 16
+    add hl, de                 ; HL = &FCB[16]
+    ld b, 16
+.wseq_ne_clr:
+    ld (hl), 0
+    inc hl
+    djnz .wseq_ne_clr
+
+    pop de                     ; Balance push de from ne_find loop
+    jp .wseq_do                ; Write the record into the new extent
+
+.wseq_ne_next:
+    pop de
+    inc de
+    jp .wseq_ne_find
+
+; ------------------------------------------------------------------
+; @proc wseq_close_cur
+; @clobbers af,bc,de,hl
+; @end
+; wseq_close_cur — Close current extent by calling bf_f16 logic
+;   Saves FCB to TPA, re-loads into fcb_buf, runs the close scan.
+;   In:  IX = fcb_buf (writeback_fcb already called)
+;   Out: IX = fcb_buf (reloaded)
+;   Clobbers: AF, BC, DE, HL
+; ------------------------------------------------------------------
+wseq_close_cur:
+    ; Reload FCB into fcb_buf from TPA (writeback already done)
+    ld de, (fcb_user_addr)
+    call setup_fcb(de)         ; IX = fcb_buf
+
+    ; Run the close directory scan (inline version that returns here)
+    call close_dir_update
+
+    ; Reload FCB again (close may have changed fcb_buf)
+    ld de, (fcb_user_addr)
+    call setup_fcb(de)         ; IX = fcb_buf
+    ret
+
+; F22: Make File
+;   In:  DE = FCB (filename in bytes 1-11)
+;   Out: HL = 0 (success), 0xFF (directory full)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f22
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f22:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Select drive from FCB
+    ld a, (ix + 0)
+    or a
+    jp z, .mk_cur
+    dec a
+    ld (cur_disk), a
+    call select_drive
+.mk_cur:
+
+    ; Scan directory for a free (E5h) entry
+    ld de, 0
+.mk_scan:
+    push de
+    call read_dir_entry        ; HL = entry, carry = past end
+    pop de
+    jp c, .mk_full
+
+    push de
+    ld a, (hl)
+    cp 0xE5
+    jp nz, .mk_next
+
+    ; Found a free directory slot — initialise it
+    push hl
+    ld b, 32                   ; Zero all 32 bytes
+.mk_zero:
+    ld (hl), 0
+    inc hl
+    djnz .mk_zero
+    pop hl                     ; HL = entry base
+
+    ; Byte 0 = user number
+    ld a, (cur_user)
+    ld (hl), a
+
+    ; Copy FCB[1..11] → entry[1..11], masking off attribute high bits
+    inc hl                     ; HL = &entry[1]
+    push ix
+    pop de
+    inc de                     ; DE = &FCB[1]
+    ex de, hl                  ; HL = &FCB[1], DE = &entry[1]
+    ld b, 11
+.mk_copy_name:
+    ld a, (hl)
+    and 0x7F                   ; Strip attribute bit
+    ld (de), a
+    inc hl
+    inc de
+    djnz .mk_copy_name        ; Bytes 12-31 remain zero: EX=0, RC=0, alloc=0
+
+    call write_dir_entry
+
+    ; Zero FCB fields: EX, S1, S2, RC, alloc map, CR, random record
+    push ix
+    pop hl
+    ld de, 12
+    add hl, de                 ; HL = &FCB[12]
+    ld b, 24                   ; Bytes 12-35
+.mk_zero_fcb:
+    ld (hl), 0
+    inc hl
+    djnz .mk_zero_fcb
+
+    pop de                     ; Balance push de from scan
+    call writeback_fcb()
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.mk_next:
+    pop de
+    inc de
+    jp .mk_scan
+
+.mk_full:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+; F23: Rename File
+;   In:  DE = FCB. Bytes 1-11 = old name, bytes 17-27 = new name.
+;   Out: HL = 0 (OK), 0xFF (not found)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f23
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f23:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Select drive
+    ld a, (ix + 0)
+    or a
+    jp z, .ren_cur
+    dec a
+    ld (cur_disk), a
+    call select_drive
+.ren_cur:
+
+    ; Scan directory for entries matching old name (bytes 1-11)
+    ld de, 0
+    ld b, 0                    ; B = found count
+.ren_scan:
+    push de
+    push bc                    ; lint: ignore — only B matters, C is don't-care
+    call read_dir_entry
+    pop bc
+    pop de
+    jp c, .ren_done
+
+    push de
+    push bc
+    push hl
+    ; Check user + old name (bytes 1-11)
+    ld a, (hl)
+    cp 0xE5
+    jp z, .ren_skip
+    ld a, (cur_user)
+    cp (hl)
+    jp nz, .ren_skip
+    ; Compare name bytes 1-11
+    push hl
+    inc hl
+    push ix
+    pop de
+    inc de                     ; DE = &FCB[1]
+    ld c, 11
+.ren_cmp:
+    ld a, (de)
+    cp '?'
+    jp z, .ren_cmp_ok
+    ld a, (hl)
+    and 0x7F
+    push bc
+    ld b, a
+    ld a, (de)
+    cp b
+    pop bc
+    jp nz, .ren_cmp_fail
+.ren_cmp_ok:
+    inc hl
+    inc de
+    dec c
+    jp nz, .ren_cmp
+    pop hl                     ; HL = entry base
+
+    ; Match — copy new name (FCB bytes 17-27) to entry bytes 1-11
+    push hl
+    inc hl                     ; HL = &entry[1]
+    push ix
+    pop de
+    ld bc, 17
+    add de, bc                 ; DE = &FCB[17] (new name)
+    ex de, hl                  ; HL = &FCB[17], DE = &entry[1]
+    ld bc, 11
+    ldir
+    pop hl
+    call write_dir_entry
+
+    pop hl                     ; balance push hl from .ren_scan
+    pop bc
+    pop de
+    inc b
+    inc de
+    jp .ren_scan
+
+.ren_cmp_fail:
+    pop hl                     ; balance push hl from cmp setup
+.ren_skip:
+    pop hl
+    pop bc
+    pop de
+    inc de
+    jp .ren_scan
+
+.ren_done:
+    ld a, b
+    or a
+    jp z, .ren_none
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+.ren_none:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; ==========================================================================
+; Random access helpers
+; ==========================================================================
+
+; @proc rand_to_seq
+; @out   a
+; @clobbers af,bc
+; @end
+; rand_to_seq — Convert random record (FCB[33-35]) to EX and CR
+;   In:  IX = FCB
+;   Out: A = 0 (OK), 6 (out of range)
+;        EX set in FCB[12], CR set in FCB[32]
+;   Clobbers: AF, BC
+;
+;   Random record R = FCB[33] + FCB[34]*256 (+ FCB[35]*65536, ignored)
+;   For our disk: EXM=0, so:
+;     EX = R / 128
+;     CR = R % 128 (= R & 0x7F)
+rand_to_seq:
+    ld a, (ix + 35)            ; R2 (high byte)
+    or a
+    jp nz, .rand_overflow
+    ld a, (ix + 34)            ; R1
+    ld b, a
+    ld a, (ix + 33)            ; R0
+    ; R = B:A (16-bit). EX = R / 128 = (B:A) >> 7
+    ; CR = R & 0x7F = A & 0x7F
+    ld c, a
+    and 0x7F
+    ld (ix + 32), a            ; CR = R & 0x7F
+    ; EX = (B << 1) | (C >> 7)
+    ld a, c
+    rlca                       ; bit 7 -> carry and bit 0
+    and 0x01                   ; A = bit 7 of R0
+    rl b                       ; B = (R1 << 1), old carry (bit7 of R0) goes to bit 0... no
+    ; Let me redo this. R = R1*256 + R0. R/128 = R1*2 + R0/128.
+    ; R0/128 = bit 7 of R0. So EX = R1*2 + (R0 >> 7).
+    ld a, c                    ; A = R0
+    rlca                       ; rotate left, bit 7 -> bit 0, old bit 7 -> carry
+    and 0x01                   ; A = R0 >> 7 (just the top bit)
+    ld c, a                    ; C = R0 >> 7
+    ld a, (ix + 34)            ; R1
+    add a, a                   ; A = R1 * 2
+    or c                       ; A = R1*2 + (R0>>7) = EX
+    ld (ix + 12), a            ; FCB.EX = EX
+    xor a                      ; Success
+    ret
+
+.rand_overflow:
+    ld a, 6                    ; "seek past end" error
+    ret
+
+
+; F33: Read Random
+;   In:  DE = FCB (R0/R1/R2 set at bytes 33-35)
+;   Out: A = 0 (OK), 1 (reading unwritten data), 3 (cannot close extent),
+;        4 (seek to unwritten extent), 6 (random record out of range)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f33
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f33:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Convert random record to EX/CR
+    call rand_to_seq
+    or a
+    jp nz, .rdrand_err
+
+    ; Find the correct extent in the directory for the target EX.
+    ld hl, 0
+    ld (search_pos), hl
+
+.rdrand_search:
+    ld de, (search_pos)
+    push de
+    call read_dir_entry
+    pop de
+    jp c, .rdrand_unwritten
+
+    push de
+    push hl
+    ld a, (hl)
+    cp 0xE5
+    jp z, .rdrand_skip
+    ld a, (cur_user)
+    cp (hl)
+    jp nz, .rdrand_skip
+
+    ; Compare name bytes 1-11
+    push hl
+    inc hl
+    push ix
+    pop de
+    inc de
+    ld b, 11
+.rdrand_cmp:
+    ld a, (hl)
+    and 0x7F
+    ld c, a
+    ld a, (de)
+    cp c
+    jp nz, .rdrand_cmp_fail
+    inc hl
+    inc de
+    djnz .rdrand_cmp
+    pop hl                     ; HL = entry base
+
+    ; Name matches — check EX
+    push hl
+    ld de, 12
+    add hl, de
+    ld a, (hl)                 ; entry EX
+    pop hl
+    ld b, a
+    ld a, (ix + 12)            ; target EX
+    cp b
+    jp nz, .rdrand_skip
+
+    ; Found! Copy RC + allocation map to FCB
+    push hl
+    ld de, 15
+    add hl, de
+    ld a, (hl)
+    ld (ix + 15), a            ; FCB.RC = entry.RC
+    inc hl                     ; HL = &entry[16]
+    ; Copy 16 bytes from entry[16-31] to FCB[16-31]
+    push ix
+    pop de
+    ld bc, 16
+    add de, bc                 ; DE = &FCB[16]
+    ld bc, 16
+    ldir
+    pop hl
+    pop de                     ; search_pos
+    pop de                     ; discard outer push
+
+    ; Now do the read: block lookup + BIOS read
+    push ix
+    ld a, (ix + 32)            ; CR
+    ld c, a
+    ld a, (cached_bsh)
+    ld b, a
+    ld a, c
+.rdrand_shr:
+    srl a
+    djnz .rdrand_shr
+    ld e, a
+    ld d, 0
+    push ix
+    pop hl
+    ld bc, 16
+    add hl, bc
+    add hl, de
+    ld a, (hl)
+    or a
+    jp z, .rdrand_unwritten2
+
+    push af
+    ld a, (ix + 32)
+    ld b, a
+    ld a, (cached_blm)
+    and b
+    ld c, a
+    pop af
+    ld l, a
+    ld h, 0
+    ld a, (cached_bsh)
+    ld b, a
+.rdrand_shl:
+    add hl, hl
+    djnz .rdrand_shl
+    ld b, 0
+    add hl, bc
+
+    ld bc, (cached_spt)
+    call div_hl_bc
+    push de
+    ld de, (cached_off)
+    add hl, de
+    ld b, h
+    ld c, l
+    call set_trk
+    pop bc
+    call set_sec
+    ld bc, (bdos_dma)
+    call set_dma
+    call disk_read
+    pop ix
+    or a
+    jp nz, .rdrand_read_err
+    call writeback_fcb()
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.rdrand_read_err:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.rdrand_unwritten2:
+    pop ix
+    ld a, 1
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.rdrand_cmp_fail:
+    pop hl                     ; balance push hl from cmp setup
+.rdrand_skip:
+    pop hl
+    pop de
+    inc de
+    ld (search_pos), de
+    jp .rdrand_search
+
+.rdrand_unwritten:
+    ld a, 4
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+.rdrand_err:
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F34: Write Random
+;   In:  DE = FCB (R0/R1/R2 set)
+;   Out: A = 0 (OK), 5 (directory full), 6 (out of range)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f34
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f34:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    call rand_to_seq
+    or a
+    jp nz, .wrrand_err
+
+    ; EX and CR are now set. Find/create the correct extent,
+    ; then use the write-sequential core logic.
+    ; We re-enter bf_f21 at its public entry with IX already set.
+    jp bf_f21_core
+
+.wrrand_err:
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F35: Compute File Size
+;   In:  DE = FCB
+;   Out: R0/R1/R2 (FCB[33-35]) = number of records in file
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f35
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f35:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; Select drive
+    ld a, (ix + 0)
+    or a
+    jp z, .fsz_cur
+    dec a
+    ld (cur_disk), a
+    call select_drive
+.fsz_cur:
+    ; Initialize result to 0
+    ld (ix + 33), 0
+    ld (ix + 34), 0
+    ld (ix + 35), 0
+
+    ; Scan all directory entries for matching name
+    ld de, 0
+.fsz_scan:
+    push de
+    call read_dir_entry
+    pop de
+    jp c, .fsz_done
+
+    push de
+    push hl
+    ; Check user + name match
+    ld a, (hl)
+    cp 0xE5
+    jp z, .fsz_skip
+    ld a, (cur_user)
+    cp (hl)
+    jp nz, .fsz_skip
+
+    push hl
+    inc hl
+    push ix
+    pop de
+    inc de
+    ld b, 11
+.fsz_cmp:
+    ld a, (hl)
+    and 0x7F
+    ld c, a
+    ld a, (de)
+    cp c
+    jp nz, .fsz_cmp_fail
+    inc hl
+    inc de
+    djnz .fsz_cmp
+    pop hl                     ; HL = entry base
+
+    ; Match — compute last record: EX * 128 + RC
+    ; And update max in R0/R1
+    push hl
+    ld de, 12
+    add hl, de
+    ld a, (hl)                 ; EX
+    ld b, a
+    ld de, 3
+    add hl, de                 ; HL = &entry[15]
+    ld c, (hl)                 ; RC
+
+    ; last_record = EX * 128 + RC = (B << 7) + C
+    ; Low byte: (B << 7) gives bit 7, plus C (0-128)
+    ld a, b
+    rrca                       ; rotate right: bit 0 -> bit 7
+    and 0x80                   ; A = (EX & 1) << 7
+    add a, c                   ; A = low byte of last_record
+    ld e, a                    ; E = R0 candidate
+    ld a, b
+    srl a                      ; A = EX >> 1 = high byte
+    jp nc, .fsz_no_carry
+    ; If (EX&1)<<7 + RC overflowed, increment high byte
+    ; Actually: E + C might overflow if C >= 128 - (EX&1)*128
+    ; Since RC <= 128 and (EX&1)<<7 is 0 or 128:
+    ;   if EX is odd, A_low = 128 + RC. If RC > 0, this overflows to 0 + carry.
+    ; Let me just do proper 16-bit math.
+.fsz_no_carry:
+    ld d, a                    ; D = R1 candidate
+
+    ; Actually let me redo this cleanly.
+    ; last_record = B * 128 + C  (B=EX, C=RC)
+    ; = B * 128 + C
+    ; Low byte = (B & 1) * 128 + C. If >= 256, carry.
+    ; High byte = B >> 1 + carry.
+    pop hl
+
+    ; Clean 16-bit calculation
+    ld a, b                    ; A = EX
+    ld h, 0
+    ld l, a
+    ; HL = EX
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = EX * 128
+    ld b, 0
+    add hl, bc                 ; HL = EX * 128 + RC
+
+    ; Compare with current max in FCB[33-34]
+    ld e, (ix + 33)
+    ld d, (ix + 34)            ; DE = current max
+    or a
+    sbc hl, de
+    add hl, de                 ; restore HL (sbc was destructive comparison)
+    jp c, .fsz_skip            ; HL < DE, keep current max
+    jp z, .fsz_skip            ; equal, keep
+    ; HL > DE, update
+    ld (ix + 33), l
+    ld (ix + 34), h
+
+.fsz_skip:
+    pop hl
+    pop de
+    inc de
+    jp .fsz_scan
+
+.fsz_cmp_fail:
+    pop hl
+    jp .fsz_skip
+
+.fsz_done:
+    call writeback_fcb()
+    xor a
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F36: Set Random Record
+;   In:  DE = FCB (EX and CR must be valid from sequential I/O)
+;   Out: R0/R1/R2 (FCB[33-35]) set from current EX and CR
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f36
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f36:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+
+    ; R = EX * 128 + CR
+    ld a, (ix + 12)            ; EX
+    ld l, a
+    ld h, 0
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = EX * 128
+    ld a, (ix + 32)            ; CR
+    ld c, a
+    ld b, 0
+    add hl, bc                 ; HL = EX * 128 + CR
+
+    ld (ix + 33), l            ; R0
+    ld (ix + 34), h            ; R1
+    ld (ix + 35), 0            ; R2
+
+    call writeback_fcb()
+    jp bdos_ret
+
+
+; F40: Write Random with Zero Fill
+;   Same as F34 but should fill unwritten blocks with zeros.
+;   For now, identical to F34 (no pre-fill).
+; @proc bf_f40
+; @param %fcb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f40:
+    pop de
+    pop bc
+    call setup_fcb(de)         ; IX = fcb_buf, copies 36 bytes from TPA
+    call rand_to_seq
+    or a
+    jp nz, .wrrand0_err
+    jp bf_f21_core
+.wrrand0_err:
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; ==========================================================================
+; @proc div_hl_bc
+; @param %dividend:u16 hl
+; @param %divisor:u16  bc
+; @out   hl
+; @out   de
+; @clobbers af
+; @end
+; Utility: 16-bit division
+;   div_hl_bc — HL = HL / BC, DE = HL % BC (remainder)
+;   Clobbers: AF
+; ==========================================================================
+div_hl_bc:
+    ld de, 0                   ; DE = remainder
+    ld a, 16                   ; 16-bit division
+.loop:
+    add hl, hl                 ; Shift dividend left
+    rl e
+    rl d                       ; Shift into remainder
+    push hl
+    ld h, d
+    ld l, e
+    or a
+    sbc hl, bc                 ; Try subtract divisor
+    jp c, .no_sub
+    ld d, h
+    ld e, l                    ; Keep subtracted remainder
+    pop hl
+    set 0, l                   ; Set quotient bit
+    dec a
+    jp nz, .loop
+    ret
+.no_sub:
+    pop hl
+    dec a
+    jp nz, .loop
+    ret
+
+
+; ==========================================================================
+; Extended BDOS Functions (F44-F112)
+; ==========================================================================
+
+; F44: Set Multi-Sector Count
+;   In: E = count (1-128)
+;   Out: A = 0 (OK) or 0xFF (error)
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f44
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f44:
+    pop de
+    pop bc
+    ld a, e
+    or a
+    jr z, .bad
+    cp 129
+    jr nc, .bad
+    ld (multi_count), a
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+.bad:
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F45: Set BDOS Error Mode
+;   In: E = mode
+;   Out: A = 0
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f45
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f45:
+    pop de
+    pop bc
+    ld a, e
+    ld (error_mode), a
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F46: Get Free Space
+;   In: E = drive (0=A:)
+;   Out: 3 bytes LE record count written to DMA, A=0, HL=0
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f46
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl,ix
+; @end
+bf_f46:
+    pop de
+    pop bc
+    ; Count free blocks in ALV (blocks 0..DSM)
+    ; ALV is a packed bit array: byte N, bit 7 = block N*8, bit 0 = block N*8+7
+    ld hl, (cached_alv)
+    ld de, 0                   ; DE = free block count
+    ld bc, 0                   ; BC = current block number
+    push ix
+    ld ix, 0
+    ld a, (cached_dsm)
+    ld ixl, a
+    ld a, (cached_dsm+1)
+    ld ixh, a                 ; IX = DSM
+.gf_byte:
+    ld a, (hl)
+    push hl
+    ld h, a                    ; H = ALV byte
+    ld l, 0x80                 ; L = bit mask, starting at bit 7
+.gf_bit:
+    ; Check if block BC > DSM (IX)
+    push hl
+    push de
+    push bc
+    pop hl                     ; HL = current block
+    push ix
+    pop de                     ; DE = DSM
+    inc de                     ; DE = DSM+1
+    or a
+    sbc hl, de                 ; block - (DSM+1)
+    pop de
+    pop hl
+    jr nc, .gf_done_pop        ; block >= DSM+1, we're done
+    ; Test bit
+    ld a, h
+    and l
+    jr nz, .gf_used            ; Bit set = block is used
+    ; Block is free
+    inc de
+.gf_used:
+    inc bc                     ; Next block
+    srl l                      ; Next bit
+    jr nz, .gf_bit             ; More bits in this byte
+    pop hl
+    inc hl                     ; Next ALV byte
+    jr .gf_byte
+
+.gf_done_pop:
+    pop hl                     ; Balance the push hl in .gf_byte
+.gf_done:
+    pop ix
+    ; DE = number of free blocks
+    ; Free records = free_blocks * (1 << BSH) = free_blocks << BSH
+    ld a, (cached_bsh)
+    ld b, a
+    ; Shift DE left by BSH bits; we need 24-bit result
+    ; Use C as high byte (bits 16-23)
+    ld c, 0
+    or a
+    jr z, .gf_noshift
+.gf_shift:
+    sla e
+    rl d
+    rl c
+    djnz .gf_shift
+.gf_noshift:
+    ; C:D:E = 24-bit free record count (big-endian)
+    ; Write to DMA as 3 bytes little-endian: E, D, C
+    push de
+    push bc                    ; Save C (high byte)
+    ld de, (bdos_dma)
+    pop bc
+    ld a, e                    ; Low byte (was pushed from DE)
+    ; Actually let me redo this more carefully
+    pop de                     ; DE restored = mid:low of free records
+    ; Now C = high byte, D = mid byte, E = low byte
+    push bc                    ; Save C
+    push de                    ; Save DE
+    ld de, (bdos_dma)
+    pop bc                     ; BC = old DE (B=mid, C=low)
+    ld a, c                    ; Byte 0 = low
+    push bc                    ; Save B (mid byte) — write_user_byte clobbers BC
+    call write_user_byte(a, de) preserving %func
+    pop bc
+    inc de
+    ld a, b                    ; Byte 1 = mid
+    push bc                    ; Save C (high byte is on stack below)
+    call write_user_byte(a, de) preserving %func
+    pop bc
+    inc de
+    pop bc                     ; Restore C = high
+    ld a, c                    ; Byte 2 = high
+    call write_user_byte(a, de) preserving %func
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F47: Chain to Program
+;   Out: A = 0xFF (not supported)
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f47
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f47:
+    pop de
+    pop bc
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F48: Flush Buffers
+;   Out: A = 0
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f48
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f48:
+    pop de
+    pop bc
+    call flush_deblock
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F49: Get/Set System Control Block
+; @proc bf_f49
+; @param %pb:u16    de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+;   In: DE = pointer to SCB parameter block in TPA
+;        PB[0] = offset, PB[1] = operation (0=get, FE=set byte, FF=set word)
+;        PB[2..3] = value for set operations
+;   Out: HL = word at SCB[offset] (for get)
+;   Clobbers: AF, BC, DE, HL
+bf_f49:
+    pop de
+    pop bc
+    ; Read offset and operation from user parameter block
+    push de
+    call read_user_byte(de) preserving %func    ; A = PB[0] = offset
+    ld c, a                    ; C = offset
+    pop de
+    inc de
+    push de
+    push bc                    ; Save C (offset) — read_user_byte clobbers BC  ; lint: ignore
+    call read_user_byte(de) preserving %func    ; A = PB[1] = operation
+    pop bc                     ; Restore C = offset
+    ld b, a                    ; B = operation
+    pop de
+    inc de
+    ; DE now points to PB[2]
+
+    ; Build the SCB value for this offset
+    ld a, b
+    or a
+    jr z, .scb_get
+    cp 0xFE
+    jr z, .scb_setbyte
+    cp 0xFF
+    jr z, .scb_setword
+    ; Unknown op, return 0
+    ld hl, 0
+    ld a, l
+    jp bdos_ret
+
+.scb_get:
+    ; Get: return word from SCB at offset C
+    call scb_read_field        ; Returns HL = word
+    ld a, l
+    jp bdos_ret
+
+.scb_setbyte:
+    ; Set byte: read PB[2], write to SCB[offset]
+    push bc                    ; Save C = offset
+    call read_user_byte(de) preserving %func    ; A = PB[2]
+    pop bc
+    ld e, a                    ; E = value
+    call scb_write_field       ; C = offset, E = value
+    ld l, e
+    ld h, 0
+    ld a, l
+    jp bdos_ret
+
+.scb_setword:
+    ; Set word: read PB[2..3], write to SCB[offset..offset+1]
+    push bc                    ; Save C = offset
+    push de
+    call read_user_byte(de) preserving %func    ; A = PB[2] (low byte)
+    ld b, a
+    pop de
+    inc de
+    push bc                    ; lint: ignore — only B matters, C is don't-care
+    call read_user_byte(de) preserving %func    ; A = PB[3] (high byte)
+    ld d, a                    ; D = high
+    pop bc                     ; B = low
+    ld e, b                    ; E = low
+    pop bc                     ; C = offset
+    push de                    ; Save value (D=high, E=low)
+    call scb_write_field       ; Write low byte at offset C
+    inc c
+    ld e, d                    ; E = high byte
+    call scb_write_field       ; Write high byte at offset C+1
+    pop hl                     ; HL = value (H=high, L=low)
+    ld a, l
+    jp bdos_ret
+
+
+; @proc scb_read_field
+; @param %offset:u8 c
+; @out   hl
+; @clobbers af,de
+; @end
+; scb_read_field — Read SCB word at offset C
+;   In: C = offset
+;   Out: HL = word (L=low, H=high)
+;   Clobbers: AF, DE
+;
+;   Syncs dynamic fields from BDOS state to the in-memory SCB,
+;   then reads directly from the SCB block in common memory.
+scb_read_field:
+    ; Sync dynamic BDOS state → SCB before reading
+    ld hl, (bdos_dma)
+    ld (scb_dma), hl
+    ld a, (cur_disk)
+    ld (scb_curdsk), a
+    ld a, (cur_user)
+    ld (scb_user), a
+    ; Read word from scb_base + C
+    ld l, c
+    ld h, 0
+    ld de, scb_base
+    add hl, de                     ; HL = &scb_base[offset]
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a                        ; HL = word at SCB[offset]
+    ret
+; @proc scb_write_field
+; @param %offset:u8  c
+; @param %value:u8   e
+; @out   e
+; @clobbers af,hl
+; @end
+; scb_write_field — Write byte E to SCB at offset C
+;   In: C = offset, E = value
+;   Out: E preserved
+;   Clobbers: AF, HL
+;
+;   Writes to the in-memory SCB block, then syncs writable fields
+;   back to BDOS state variables.
+scb_write_field:
+    ; Write byte to scb_base + C
+    ld l, c
+    ld h, 0
+    push de                        ; Save E (value)
+    ld de, scb_base
+    add hl, de                     ; HL = &scb_base[offset]
+    pop de
+    ld (hl), e                     ; Write value
+    ; Sync writable SCB fields → BDOS state
+    ld a, (scb_curdsk)
+    ld (cur_disk), a
+    ld a, (scb_user)
+    ld (cur_user), a
+    ld hl, (scb_dma)
+    ld (bdos_dma), hl
+    ret
+
+
+; F50: Direct BIOS Call
+;   In:  DE = pointer to BIOS Parameter Block in TPA:
+;         PB[0]   = BIOS function number (0-32)
+;         PB[1]   = A register
+;         PB[2-3] = BC (C lo, B hi)
+;         PB[4-5] = DE (E lo, D hi)
+;         PB[6-7] = HL (L lo, H hi)
+;   Out: HL, A = return values from BIOS function
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f50
+; @param %pb:u16    de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f50:
+    pop de
+    pop bc
+    ; Read 8-byte parameter block from TPA
+    call read_user_byte(de) preserving %func        ; PB[0] = func
+    ld (_f50_func), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[1] = A
+    ld (_f50_a), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[2] = C
+    ld (_f50_c), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[3] = B
+    ld (_f50_b), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[4] = E
+    ld (_f50_e), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[5] = D
+    ld (_f50_d), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[6] = L
+    ld (_f50_l), a
+    inc de
+    call read_user_byte(de) preserving %func        ; PB[7] = H
+    ld (_f50_h), a
+
+    ; Compute BIOS table target: func * 3
+    ld a, (_f50_func)
+    cp 33
+    jr nc, .f50_bad
+    ld l, a
+    ld h, 0
+    ld d, h
+    ld e, l
+    add hl, hl
+    add hl, de                     ; HL = func * 3
+    ld (_f50_target), hl
+
+    ; Set up registers from PB and call BIOS function via RET trick.
+    ; Push return address so the BIOS function RETs back to us.
+    ld a, (_f50_a)
+    ld bc, (_f50_bc)
+    ld de, (_f50_de)
+    ld hl, .f50_return
+    push hl                        ; Return address for BIOS function
+    ld hl, (_f50_hl)
+    push hl                        ; PB's HL value
+    ld hl, (_f50_target)
+    ex (sp), hl                    ; Stack: [target, .f50_return], HL = PB's HL
+    ret                            ; JP to BIOS function with all regs set
+
+.f50_return:
+    ; BIOS function returned. A, HL have results.
+    jp bdos_ret
+
+.f50_bad:
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+_f50_func:   db 0
+_f50_a:      db 0
+_f50_bc:
+_f50_c:      db 0
+_f50_b:      db 0
+_f50_de:
+_f50_e:      db 0
+_f50_d:      db 0
+_f50_hl:
+_f50_l:      db 0
+_f50_h:      db 0
+_f50_target: dw 0
+
+
+; F98: Free Blocks — Rebuild ALV from directory
+;   Out: A = 0
+;   Clobbers: AF, BC, DE, HL, IX
+; @proc bf_f98
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl,ix
+; @end
+bf_f98:
+    pop de
+    pop bc
+    call build_alv
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F99: Truncate File (stub)
+;   Out: A = 0xFF
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f99
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f99:
+    pop de
+    pop bc
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F100: Set Directory Label (stub)
+;   Out: A = 0xFF
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f100
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f100:
+    pop de
+    pop bc
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F101: Get Directory Label
+;   Out: A = 0 (no labels)
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f101
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f101:
+    pop de
+    pop bc
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F102: Read File XFCB (stub)
+;   Out: A = 0xFF
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f102
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f102:
+    pop de
+    pop bc
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F103: Write File XFCB (stub)
+;   Out: A = 0xFF
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f103
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f103:
+    pop de
+    pop bc
+    ld a, 0xFF
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F104: Set Date and Time
+;   In: DE = pointer to 4-byte DAT in TPA [days_lo, days_hi, hour, min]
+;   Out: A = 0
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f104
+; @param %dat:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f104:
+    pop de
+    pop bc
+    ; Read 4 bytes from TPA at DE
+    push de
+    call read_user_byte(de) preserving %func    ; A = days_lo
+    ld (scb_date), a
+    pop de
+    inc de
+    push de
+    call read_user_byte(de) preserving %func    ; A = days_hi
+    ld (scb_date+1), a
+    pop de
+    inc de
+    ; Read BCD hour → binary, multiply by 60
+    push de
+    call read_user_byte(de) preserving %func    ; A = BCD hour
+    call bcd_to_bin                              ; A = binary hour
+    pop de
+    inc de
+    ld l, a
+    ld h, 0                        ; HL = hour
+    add hl, hl
+    add hl, hl                     ; HL = hour * 4
+    push hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                     ; HL = hour * 32
+    add hl, hl                     ; HL = hour * 64
+    pop de                         ; DE = hour * 4
+    or a
+    sbc hl, de                     ; HL = hour * 60
+    push hl                        ; save hour * 60
+    ; Read BCD min → binary, add to hour*60
+    call read_user_byte(de) preserving %func    ; A = BCD min
+    call bcd_to_bin                              ; A = binary min
+    ld e, a
+    ld d, 0
+    pop hl                         ; HL = hour * 60
+    add hl, de                     ; HL = minutes since midnight
+    ld (scb_minute), hl
+    xor a
+    ld (scb_sec), a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F105: Get Date and Time
+;   Out: DMA[0..4] = days_lo, days_hi, hour, min, sec (BCD)
+;        A = BCD sec, HL = scb_date
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f105
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f105:
+    pop de
+    pop bc
+    ld de, (bdos_dma)
+    ld a, (scb_date)
+    call write_user_byte(a, de) preserving %func ; DMA[0] = days_lo
+    inc de
+    ld a, (scb_date+1)
+    call write_user_byte(a, de) preserving %func ; DMA[1] = days_hi
+    inc de
+    ; minutes → BCD hour + BCD minute
+    ld hl, (scb_minute)
+    call div_hl_60                  ; A = hour, L = minute
+    ld b, l                         ; B = minute (bin_to_bcd preserves BC)
+    call bin_to_bcd                 ; A = BCD hour
+    call write_user_byte(a, de) preserving %func ; DMA[2] = BCD hour
+    inc de
+    ld a, b                         ; A = minute
+    call bin_to_bcd                 ; A = BCD minute
+    call write_user_byte(a, de) preserving %func ; DMA[3] = BCD minute
+    inc de
+    ld a, (scb_sec)
+    call bin_to_bcd                 ; A = BCD second
+    ld b, a                         ; save BCD sec (write_user_byte may clobber A)
+    call write_user_byte(a, de) preserving %func ; DMA[4] = BCD sec
+    ld hl, (scb_date)
+    ld a, b                         ; A = BCD sec (return value)
+    jp bdos_ret
+
+
+; ------------------------------------------------------------------
+; bcd_to_bin — convert BCD byte to binary
+;
+; @proc bcd_to_bin
+; @param %bcd:u8  a                ; BCD value (e.g. 0x23 = 23)
+; @out   a                         ; binary value
+; @clobbers af
+; @end
+bcd_to_bin:
+    push bc
+    ld b, a
+    and 0x0F
+    ld c, a                         ; C = units
+    ld a, b
+    rrca
+    rrca
+    rrca
+    rrca
+    and 0x0F                        ; A = tens
+    ld b, a
+    add a, a
+    add a, a
+    add a, a                        ; tens * 8
+    add a, b
+    add a, b                        ; tens * 10
+    add a, c                        ; + units
+    pop bc
+    ret
+
+
+; ------------------------------------------------------------------
+; bin_to_bcd — convert binary byte to BCD
+;
+; @proc bin_to_bcd
+; @param %val:u8  a                ; binary 0-99
+; @out   a                         ; BCD encoded
+; @clobbers af
+; @end
+bin_to_bcd:
+    push bc
+    ld b, 0
+.lp:
+    cp 10
+    jr c, .done
+    sub 10
+    inc b
+    jr .lp
+.done:
+    ld c, a                         ; C = units
+    ld a, b                         ; A = tens
+    add a, a
+    add a, a
+    add a, a
+    add a, a                        ; tens << 4
+    or c                            ; (tens << 4) | units
+    pop bc
+    ret
+
+
+; ------------------------------------------------------------------
+; div_hl_60 — divide HL by 60
+;
+; @proc div_hl_60
+; @param %dividend:u16  hl         ; 0-1439
+; @out   a                         ; quotient (0-23)
+; @out   l                         ; remainder (0-59)
+; @clobbers af,h
+; @end
+div_hl_60:
+    push bc
+    xor a
+.lp:
+    ld b, a
+    ld a, h
+    or a
+    jr nz, .sub
+    ld a, l
+    cp 60
+    jr c, .done
+.sub:
+    ld a, l
+    sub 60
+    ld l, a
+    jr nc, .nb
+    dec h
+.nb:
+    ld a, b
+    inc a
+    jr .lp
+.done:
+    ld a, b
+    pop bc
+    ret
+
+
+; F106: Set Default Password (stub)
+;   Out: A = 0
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f106
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f106:
+    pop de
+    pop bc
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F107: Get Serial Number
+;   Out: 6 bytes "CPM31\0" written to DMA
+;        A = 0
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f107
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f107:
+    pop de
+    pop bc
+    ld de, (bdos_dma)
+    ld a, 'C'
+    call write_user_byte(a, de) preserving %func
+    inc de
+    ld a, 'P'
+    call write_user_byte(a, de) preserving %func
+    inc de
+    ld a, 'M'
+    call write_user_byte(a, de) preserving %func
+    inc de
+    ld a, '3'
+    call write_user_byte(a, de) preserving %func
+    inc de
+    ld a, '1'
+    call write_user_byte(a, de) preserving %func
+    inc de
+    xor a
+    call write_user_byte(a, de) preserving %func
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F108: Get/Set Program Return Code
+;   In: DE = 0xFFFF to get, else sets return_code = DE
+;   Out: HL = return_code (get) or A = 0 (set)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f108
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f108:
+    pop de
+    pop bc
+    ld a, d
+    and e
+    cp 0xFF                    ; DE == 0xFFFF?
+    jr nz, .rc_set
+    ; Get: return current return_code in HL
+    ld hl, (return_code)
+    ld a, l
+    jp bdos_ret
+.rc_set:
+    ld (return_code), de
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F109: Get/Set Console Mode
+;   In: DE = 0xFFFF to get, else sets con_mode = DE
+;   Out: HL = con_mode (get) or A = 0 (set)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f109
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f109:
+    pop de
+    pop bc
+    ld a, d
+    and e
+    cp 0xFF                    ; DE == 0xFFFF?
+    jr nz, .cm_set
+    ld hl, (con_mode)
+    ld a, l
+    jp bdos_ret
+.cm_set:
+    ld (con_mode), de
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F110: Get/Set Output Delimiter
+;   In: E = 0xFF to get, else sets out_delim = E
+;   Out: A = delimiter (get) or A = 0 (set)
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f110
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f110:
+    pop de
+    pop bc
+    ld a, e
+    cp 0xFF
+    jr nz, .dl_set
+    ; Get current delimiter
+    ld a, (out_delim)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+.dl_set:
+    ld a, e
+    ld (out_delim), a
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F111: Print Block to Console
+;   In: DE = pointer to CCB in TPA: [addr_lo, addr_hi, len_lo, len_hi]
+;   Out: A = 0
+;   Clobbers: AF, BC, DE, HL
+; @proc bf_f111
+; @param %ccb:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f111:
+    pop de
+    pop bc
+    ; Read CCB from TPA: [addr_lo, addr_hi, len_lo, len_hi]
+    push de
+    call read_user_byte(de) preserving %func    ; A = addr_lo
+    ld c, a
+    pop de
+    inc de
+    push de
+    push bc                    ; lint: ignore — save C (addr_lo), B is don't-care
+    call read_user_byte(de) preserving %func    ; A = addr_hi
+    pop bc
+    ld b, a                    ; BC = text address in TPA
+    pop de
+    inc de
+    push de
+    push bc                    ; Save BC (TPA addr) — read_user_byte clobbers BC
+    call read_user_byte(de) preserving %func    ; A = len_lo
+    pop bc
+    ld l, a
+    pop de
+    inc de
+    push de
+    push bc
+    call read_user_byte(de) preserving %func    ; A = len_hi
+    pop bc
+    ld h, a                    ; HL = length
+    pop de
+    ; BC = TPA address of text, HL = length
+.pb_loop:
+    ld a, h
+    or l
+    jr z, .pb_done
+    push hl                    ; Save remaining length
+    push bc                    ; Save TPA pointer
+    ld d, b
+    ld e, c                    ; DE = current TPA address
+    call read_user_byte(de) preserving %func    ; A = char from TPA
+    ld c, a
+    call con_out               ; Output character
+    pop bc
+    inc bc                     ; Next TPA address
+    pop hl
+    dec hl                     ; Length--
+    jr .pb_loop
+.pb_done:
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F112: List Block to Printer (stub, no printer)
+;   Out: A = 0
+;   Clobbers: AF, DE, BC, HL
+; @proc bf_f112
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f112:
+    pop de
+    pop bc
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret

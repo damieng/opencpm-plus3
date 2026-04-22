@@ -1,0 +1,1299 @@
+; ==========================================================================
+; Mini-CCP — Minimal Console Command Processor for CP/M 3.1
+; ==========================================================================
+;
+; Runs at 0100h in the TPA (bank 0).
+; Provides the A> prompt, reads commands via BDOS F10,
+; and handles a few built-in commands.
+;
+; BDOS calls go through address 0005 (set up by BIOS).
+;
+; Assembled separately, INCBINed by the BIOS module.
+;   sjasmplus --raw=build/miniccp.bin src/ccp/miniccp.asm
+;
+; ==========================================================================
+
+    org 0x0100
+
+BDOS    equ 0x0005             ; BDOS entry point
+FCB1    equ 0x005C             ; Default FCB 1
+DMA     equ 0x0080             ; Default DMA / command tail
+
+; BDOS function numbers
+F_COUT  equ 2                  ; Console output (E = char)
+F_PSTR  equ 9                  ; Print string (DE = addr, '$' terminated)
+F_RDBUF equ 10                 ; Read console buffer (DE = buf addr)
+F_CSTAT equ 11                 ; Console status
+F_SCB   equ 49                 ; Get/Set SCB byte (DE→[offset,op]; op=0=get)
+F_BIOS  equ 50                 ; Direct BIOS call (DE→8-byte BIOSPB)
+
+; ==========================================================================
+; CCP Entry Point
+; ==========================================================================
+
+; @proc ccp_start
+; @clobbers af,bc,de,hl
+; @end
+ccp_start:
+    ld sp, ccp_stack           ; Local stack
+
+    ; Rebuild ALV from directory (fn 13 Reset Disk System) but preserve
+    ; the user's current drive across the reset — without this, running
+    ; A:PROG from a B> prompt would drop us back to A> after PROG exits,
+    ; because fn 13 resets cur_disk to A: per CP/M spec.
+    ld c, 25                   ; F25: Return Current Disk
+    call BDOS
+    push af                    ; Save user's drive
+    ld c, 13                   ; F13: Reset Disk System
+    call BDOS
+    pop af
+    ld e, a
+    ld c, 14                   ; F14: Select Disk — restore user's drive
+    call BDOS
+
+.prompt:
+    ; Prompt: CRLF + drive letter (from BDOS) + '>'
+    ld c, 25                   ; F25: Return Current Disk
+    call BDOS                  ; A = current drive (0-15)
+    ld (cur_drive), a
+
+    ld e, 0x0D
+    ld c, F_COUT
+    call BDOS
+    ld e, 0x0A
+    ld c, F_COUT
+    call BDOS
+    ld a, (cur_drive)
+    add a, 'A'
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+    ld e, '>'
+    ld c, F_COUT
+    call BDOS
+
+    ; Read command line
+    ld de, cmd_buf
+    ld c, F_RDBUF
+    call BDOS
+
+    ; Parse and execute
+    call parse_cmd
+    jr .prompt
+
+
+; ==========================================================================
+; parse_cmd — Parse the command buffer and dispatch
+;   In:  cmd_buf filled by BDOS F10
+;   Out: nothing (may not return if command reboots)
+;   Clobbers: everything
+; ==========================================================================
+; @proc parse_cmd
+; @clobbers af,bc,de,hl
+; @end
+parse_cmd:
+    ld a, (cmd_buf + 1)        ; Characters read
+    or a
+    ret z                      ; Empty line — just re-prompt
+
+    ; Null-terminate the command for easier parsing
+    ld l, a
+    ld h, 0
+    ld de, cmd_buf + 2
+    add hl, de
+    ld (hl), 0                 ; Null terminate
+
+    ; Point to start of command text
+    ld hl, cmd_buf + 2
+
+    ; Skip leading spaces
+.skip_space:
+    ld a, (hl)
+    cp ' '
+    jr nz, .got_cmd
+    inc hl
+    jr .skip_space
+
+.got_cmd:
+    ; Check for drive switch: "X:" where X is A-P, optionally followed by
+    ; space, CR, or end of line. Dispatches to BDOS F14 (Select Disk).
+    ld a, (hl)
+    call to_upper
+    cp 'A'
+    jr c, .check_builtins
+    cp 'P' + 1
+    jr nc, .check_builtins
+    ld b, a                    ; B = uppercase drive letter
+    push hl
+    inc hl
+    ld a, (hl)
+    cp ':'
+    jr nz, .not_drive
+    inc hl
+    ld a, (hl)
+    or a
+    jr z, .do_drive_switch
+    cp ' '
+    jr z, .do_drive_switch
+    cp 0x0D
+    jr z, .do_drive_switch
+.not_drive:
+    pop hl
+    jr .check_builtins
+.do_drive_switch:
+    pop hl
+    ld a, b
+    sub 'A'
+    ld e, a
+    ld c, 14                   ; F14: Select Disk
+    call BDOS
+    ret
+
+.check_builtins:
+    ; Check against built-in commands
+    ld de, cmd_dir
+    call str_match
+    jr z, .do_dir
+
+    ld de, cmd_type
+    call str_match
+    jp z, .do_type
+
+    ld de, cmd_help
+    call str_match
+    jp z, .do_help
+
+    ld de, cmd_screen
+    call str_match
+    jp z, .do_screen
+
+    ; Not a built-in — try loading as .COM file
+    ; HL still points to start of command text (str_match preserves HL)
+    jp .do_load_com
+
+; --- Built-in commands ---
+
+.do_dir:
+    ; Check for optional filename argument
+    ld hl, cmd_buf + 2
+.dir_skip_cmd:
+    ld a, (hl)
+    or a
+    jr z, .dir_no_arg
+    cp ' '
+    jr z, .dir_found_space
+    inc hl
+    jr .dir_skip_cmd
+.dir_found_space:
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr z, .dir_found_space
+    or a
+    jr z, .dir_no_arg
+    ; HL points to argument — detect optional "X:" drive prefix
+    ld c, 0
+    ld a, (hl)
+    call to_upper
+    cp 'A'
+    jr c, .dir_try_parse
+    cp 'P' + 1
+    jr nc, .dir_try_parse
+    push hl
+    inc hl
+    ld a, (hl)
+    cp ':'
+    jr nz, .dir_not_drv
+    pop hl
+    ld a, (hl)
+    call to_upper
+    sub 'A' - 1
+    ld c, a
+    jr .dir_try_parse
+.dir_not_drv:
+    pop hl
+.dir_try_parse:
+    push bc
+    call parse_filename
+    pop bc
+    jr nc, .dir_got_fcb
+    ; Parse failed — use wildcard with detected drive (e.g. "DIR B:")
+    ld a, c
+    or a
+    jr nz, .dir_wildcard_drv
+    jr .dir_no_arg
+.dir_got_fcb:
+    ; Copy type_fcb to dir_fcb
+    ld hl, type_fcb
+    ld de, dir_fcb
+    ld bc, 36
+    ldir
+    ; Override drive if "X:" was detected
+    ld a, c
+    or a
+    jr z, .dir_check_ext
+    ld (dir_fcb), a
+.dir_check_ext:
+    ; If ext is spaces (no explicit ext given), fill with '?' so
+    ; DIR FOO matches FOO.* (standard CP/M behavior)
+    ld hl, dir_fcb + 9
+    ld a, (hl)
+    cp ' '
+    jr nz, .dir_search
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr nz, .dir_search
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr nz, .dir_search
+    ld hl, dir_fcb + 9
+    ld (hl), '?'
+    inc hl
+    ld (hl), '?'
+    inc hl
+    ld (hl), '?'
+    jr .dir_search
+.dir_wildcard_drv:
+    ld hl, dir_fcb
+    ld (hl), a
+    inc hl
+    ld b, 11
+    ld a, '?'
+    jr .fill_q
+.dir_no_arg:
+    ld hl, dir_fcb
+    ld (hl), 0
+    inc hl
+    ld b, 11
+    ld a, '?'
+.fill_q:
+    ld (hl), a
+    inc hl
+    djnz .fill_q
+.dir_search:
+    ; Compute display drive for prefix from dir_fcb[0]
+    ld a, (dir_fcb)
+    or a
+    jr nz, .dir_got_ddrv
+    ld a, (cur_drive)
+    jr .dir_ddrv_set
+.dir_got_ddrv:
+    dec a
+.dir_ddrv_set:
+    ld (dir_display_drive), a
+
+    ; Compute columns from screen width (query SCB offset 0x1A = conwidth = cols-1)
+    ; Each column = "FILENAME TYP" (13) + " : " (3) = 16 chars
+    ; Plus "A: " prefix (3). Line = 3 + N*13 + (N-1)*3 = 16*N.
+    ; So N = floor(SCR_WIDTH / 16).
+    ld de, scr_query_pb
+    ld c, F_SCB
+    call BDOS
+    inc a                      ; conwidth+1 = actual column count
+    ld c, 0                    ; C = column count
+.div16:
+    sub 16
+    jr c, .div_done
+    inc c
+    jr .div16
+.div_done:
+    ld a, c
+    or a
+    jr nz, .cols_ok
+    inc c                      ; Minimum 1 column
+.cols_ok:
+    ld a, c
+    ld (dir_maxcols), a
+
+    ; Search first
+    ld de, dir_fcb
+    ld c, 17                   ; F17: Search First
+    call BDOS
+    cp 0xFF
+    jp z, .dir_empty
+
+    ld b, 0                    ; B = column counter (0-based)
+.dir_loop:
+    ; A = index (0-3) of match in DMA buffer
+    ; Entry is at DMA + A*32
+    push bc
+    ld l, a
+    ld h, 0
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = A * 32
+    ld de, DMA
+    add hl, de                 ; HL = entry address
+
+    ; Skip entries with extent > 0 (avoid duplicate filenames)
+    push hl
+    ld de, 12
+    add hl, de
+    ld a, (hl)                 ; EX field
+    pop hl
+    or a
+    jr nz, .dir_next_skip
+
+    ; At start of line: print "A: " prefix; otherwise print " : " separator
+    pop bc                     ; B = column counter
+    push bc
+    ld a, b
+    or a
+    jr nz, .mid_line
+    ; Start of line — print drive prefix
+    push hl
+    ld a, (dir_display_drive)
+    add a, 'A'
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+    ld e, ':'
+    ld c, F_COUT
+    call BDOS
+    ld e, ' '
+    ld c, F_COUT
+    call BDOS
+    pop hl
+    jr .print_entry
+.mid_line:
+    ; Mid-line — print separator before this entry
+    push hl
+    ld de, dir_sep
+    ld c, F_PSTR
+    call BDOS
+    pop hl
+.print_entry:
+
+    ; Print filename: 8 chars name (space-padded)
+    inc hl                     ; Skip user byte
+    ld b, 8
+.pr_name:
+    ld a, (hl)
+    and 0x7F                   ; Mask attribute bit
+    push hl
+    push bc
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+    pop bc
+    pop hl
+    inc hl
+    djnz .pr_name
+
+    ; Space between name and type (where dot would be)
+    push hl
+    ld e, ' '
+    ld c, F_COUT
+    call BDOS
+    pop hl
+
+    ; Print type (3 chars, no dot — real CP/M style)
+    ld b, 3
+.pr_type:
+    ld a, (hl)
+    and 0x7F
+    push hl
+    push bc
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+    pop bc
+    pop hl
+    inc hl
+    djnz .pr_type
+
+    ; Advance column
+    pop bc                     ; B = column counter
+    inc b
+    ld a, (dir_maxcols)
+    cp b                       ; Reached max columns?
+    jr nz, .dir_next           ; Not yet — separator printed before next entry
+    ; End of line
+    push bc
+    ld de, msg_crlf
+    ld c, F_PSTR
+    call BDOS
+    pop bc
+    ld b, 0                    ; Reset column
+    jr .dir_next
+
+.dir_next_skip:
+    pop bc                     ; Balance the push bc at .dir_loop entry
+.dir_next:
+    ; Search next
+    push bc
+    ld c, 18                   ; F18: Search Next
+    call BDOS
+    pop bc
+    cp 0xFF
+    jp nz, .dir_loop
+
+    ; Final newline
+    ld de, msg_crlf
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.dir_empty:
+    ld de, msg_no_files
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.do_type:
+    ; Skip past "TYPE" in the command buffer to find the filename
+    ld hl, cmd_buf + 2
+.type_skip_cmd:
+    ld a, (hl)
+    cp ' '
+    jr z, .type_skip_sp
+    or a
+    jr z, .type_no_arg
+    inc hl
+    jr .type_skip_cmd
+.type_skip_sp:
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr z, .type_skip_sp
+    or a
+    jr z, .type_no_arg
+
+    ; HL points to filename. Parse into FCB.
+    call parse_filename        ; HL = filename string → type_fcb filled
+    jr c, .type_no_arg         ; Carry = parse failed
+
+    ; Open file
+    ld de, type_fcb
+    ld c, 15                   ; F15: Open File
+    call BDOS
+    cp 0xFF
+    jr z, .type_not_found
+
+    ; Read and print records until EOF
+.type_loop:
+    ; Set DMA to 0080h
+    ld de, 0x0080
+    ld c, 26                   ; F26: Set DMA
+    call BDOS
+
+    ; Read sequential
+    ld de, type_fcb
+    ld c, 20                   ; F20: Read Sequential
+    call BDOS
+    or a
+    jr nz, .type_eof           ; Non-zero = EOF or error
+
+    ; Print 128 bytes from DMA, stop at Ctrl-Z (0x1A)
+    ld hl, 0x0080
+    ld b, 128
+.type_char:
+    ld a, (hl)
+    cp 0x1A                    ; Ctrl-Z = EOF marker
+    jr z, .type_eof
+    push hl
+    push bc
+    ld e, a
+    ld c, 2                    ; F2: Console Output
+    call BDOS
+    pop bc
+    pop hl
+    inc hl
+    djnz .type_char
+    jr .type_loop
+
+.type_eof:
+    ; Print final newline
+    ld e, 0x0D
+    ld c, 2
+    call BDOS
+    ld e, 0x0A
+    ld c, 2
+    call BDOS
+    ret
+
+.type_no_arg:
+    ld de, msg_type_usage
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.type_not_found:
+    ld de, msg_type_nf
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.do_help:
+    ld de, msg_help
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.do_screen:
+    ; Skip past "SCREEN" in the command buffer to find argument
+    ld hl, cmd_buf + 2
+.screen_skip_cmd:
+    ld a, (hl)
+    cp ' '
+    jr z, .screen_skip_sp
+    or a
+    jr z, .screen_query        ; No argument: query current mode
+    inc hl
+    jr .screen_skip_cmd
+.screen_skip_sp:
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr z, .screen_skip_sp
+    or a
+    jr z, .screen_query        ; Only spaces after command: query mode
+
+    ; Parse argument
+    cp '3'
+    jr nz, .try_51
+    inc hl
+    ld a, (hl)
+    cp '2'
+    jp nz, .screen_bad
+    ld a, 32
+    jr .screen_set
+
+.try_51:
+    cp '5'
+    jr nz, .screen_bad
+    inc hl
+    ld a, (hl)
+    cp '1'
+    jp nz, .screen_bad
+    ld a, 51
+
+.screen_set:
+    ld (screen_biospb + 1), a  ; Patch A field in BIOSPB (byte 1 = A param)
+    ld de, screen_biospb
+    ld c, F_BIOS
+    call BDOS
+    ret
+
+.screen_query:
+    ld de, scr_query_pb
+    ld c, F_SCB
+    call BDOS
+    inc a                      ; conwidth+1 = actual columns
+    push af
+    ld de, str_screen_mode
+    ld c, F_PSTR
+    call BDOS
+    pop af
+    call print_decimal_a
+    ld de, str_cols_crlf
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+.screen_bad:
+    ld de, str_screen_usage
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+
+; ==========================================================================
+; .do_load_com — Try to load and execute COMMAND.COM
+;   HL points to the command name in the input buffer.
+;   Parse the name, append .COM, open, load to 0100h, execute.
+; ==========================================================================
+.do_load_com:
+    ; Parse command name into com_fcb (reuse parse_filename)
+    ; First, extract just the command name (up to space or null)
+    call parse_filename        ; Fills type_fcb from (HL)
+    jp c, .com_unknown         ; Parse error
+
+    ; Force extension to "COM"
+    ld a, 'C'
+    ld (type_fcb + 9), a
+    ld a, 'O'
+    ld (type_fcb + 10), a
+    ld a, 'M'
+    ld (type_fcb + 11), a
+
+    ; Clear FCB fields 12-35 (EX, S1, S2, RC, alloc, CR)
+    ld hl, type_fcb + 12
+    ld b, 24
+    xor a
+.clr_fcb:
+    ld (hl), a
+    inc hl
+    djnz .clr_fcb
+
+    ; Open the .COM file
+    ld de, type_fcb
+    ld c, 15                   ; F15: Open File
+    call BDOS
+    cp 0xFF
+    jp z, .com_unknown         ; Not found → print "?"
+
+    ; (Command tail is set up after FCB parsing, so clear_fcb_de
+    ; on FCB2 at 006Ch doesn't clobber the tail at 0080h.)
+
+.com_do_load:
+    ; Load .COM file to 0100h via a page-zero stub.
+    ;
+    ; The stub and its FCB copy live in page zero (0x0008+).
+    ; The stub uses .stub_fcb (not 005Ch) for reading, so FCB1/FCB2
+    ; at 005Ch/006Ch remain intact for the loaded program.
+    ;
+    ; Layout in page zero:
+    ;   0x0008 .. 0x0008+stub_size-1 : loader stub code
+    ;   .stub_fcb = 0x0008+stub_size  : 36-byte command FCB copy
+    ;   0x0038                        : ISR vector (preserved: stub fits below)
+
+    ; --- Parse arguments into FCB1 (005Ch) and FCB2 (006Ch) ---
+    ; HL still points into cmd_buf after .com_found_space / .com_no_args.
+    ; Re-scan from command tail to find the first argument.
+    ld hl, cmd_buf + 2
+.com_skip_cmd:
+    ld a, (hl)
+    or a
+    jr z, .com_args_done       ; No args at all
+    cp ' '
+    jr z, .com_found_arg_space
+    inc hl
+    jr .com_skip_cmd
+.com_found_arg_space:
+    ; Skip spaces between command and first arg
+    inc hl
+    ld a, (hl)
+    cp ' '
+    jr z, .com_found_arg_space
+
+    ; Parse first argument into FCB1 at 005Ch
+    ld de, 0x005C
+    or a                       ; Check if null (no arg)
+    jr z, .com_clear_fcb2
+    call parse_fcb             ; HL advanced past first arg
+
+    ; Skip spaces between first and second arg
+.com_skip_space2:
+    ld a, (hl)
+    or a
+    jr z, .com_clear_fcb2
+    cp ' '
+    jr nz, .com_parse_arg2
+    inc hl
+    jr .com_skip_space2
+
+.com_parse_arg2:
+    ; Parse second argument into FCB2 at 006Ch
+    ld de, 0x006C
+    call parse_fcb
+    jr .com_load_file
+
+.com_args_done:
+    ; No arguments — clear FCB1 at 005Ch
+    ld de, 0x005C
+    call .clear_fcb_de
+
+.com_clear_fcb2:
+    ; Clear FCB2 at 006Ch
+    ld de, 0x006C
+    call .clear_fcb_de
+
+.com_load_file:
+    ; --- Set up command tail at 0080h ---
+    ; Done here (after FCB parsing) so clear_fcb_de on FCB2 at 006Ch
+    ; doesn't clobber the tail at 0080h (006Ch + 36 = 0090h).
+    ld hl, cmd_buf + 2
+.com_skip_name:
+    ld a, (hl)
+    or a
+    jr z, .com_no_tail
+    cp ' '
+    jr z, .com_found_space
+    inc hl
+    jr .com_skip_name
+.com_found_space:
+    ; HL points to space after command. Copy rest to 0081h+
+    ld de, 0x0081
+    ld b, 0                    ; Length counter
+.com_copy_tail:
+    ld a, (hl)
+    or a
+    jr z, .com_tail_done
+    ld (de), a
+    inc hl
+    inc de
+    inc b
+    jr .com_copy_tail
+.com_tail_done:
+    ld a, b
+    ld (0x0080), a             ; Store tail length
+    jr .com_tail_ready
+
+.com_no_tail:
+    xor a
+    ld (0x0080), a             ; Empty tail
+
+.com_tail_ready:
+    ; Copy type_fcb to high TPA where it won't be overwritten by the
+    ; loaded program. Place it just below the SCB base (start of
+    ; common memory). Must NOT use bios_visible-36 which overlaps
+    ; the SCB date/time fields, nor bdos_stub area.
+    ; SCB base = scb_common value = word stored at page zero 0x0001
+    ; minus 3 (bios_visible), minus 100 (SCB size). But simpler:
+    ; the BIOS stores scb_common at SCB offset 0x3A. We know common
+    ; memory starts at FA00h for our system, so use that directly.
+    ld hl, 0xFA00 - 36         ; Just below SCB base
+    ld (.stub_fcb_addr), hl    ; Save for patching the stub
+    ex de, hl                  ; DE = high TPA FCB address
+    ld hl, type_fcb
+    ld bc, 36
+    ldir
+
+    ; Copy the loader stub to 0x0008
+    ld hl, .stub_src
+    ld de, 0x0008
+    ld bc, .stub_src_end - .stub_src
+    ldir
+
+    ; Patch the stub's FCB address (the LD DE,xxxx at offset .stub_fcb_ref)
+    ld hl, (.stub_fcb_addr)
+    ld (0x0008 + .stub_fcb_ref - .stub_src + 1), hl  ; +1 to skip the LD DE opcode
+
+    ; Set SP to top of TPA so the stack is above the loaded file
+    ld sp, (0x0006)            ; BDOS entry address = top of TPA
+    ; Jump to stub
+    jp 0x0008
+
+.stub_fcb_addr: dw 0          ; Patched FCB address in high TPA
+
+    ; Helper: clear 36-byte FCB at DE (drive=0, name/ext=spaces, rest=0)
+.clear_fcb_de:
+    push de
+    ld h, d
+    ld l, e
+    ld (hl), 0
+    inc de
+    ld b, 11
+    ld a, ' '
+.clr_name:
+    ld (de), a
+    inc de
+    djnz .clr_name
+    xor a
+    ld b, 24
+.clr_rest:
+    ld (de), a
+    inc de
+    djnz .clr_rest
+    pop de
+    ret
+
+    ; The stub is position-independent (JR=relative, CALL/JP=absolute).
+    ; The FCB address in the LD DE below is patched by the CCP before jumping here.
+.stub_src:
+    ld hl, 0x0100              ; Load address
+.stub_loop:
+    push hl
+    ld d, h
+    ld e, l
+    ld c, 26                   ; F26: Set DMA
+    call 0x0005
+    pop hl
+    push hl
+.stub_fcb_ref:
+    ld de, 0x0000              ; FCB in high TPA (PATCHED by CCP before jump)
+    ld c, 20                   ; F20: Read Sequential
+    call 0x0005
+    pop hl
+    or a
+    jr nz, .stub_done          ; EOF/error → done loading
+    ld de, 128
+    add hl, de
+    jr .stub_loop
+.stub_done:
+    ; Reset DMA, then jump to loaded program
+    ld de, 0x0080
+    ld c, 26
+    call 0x0005
+    jp 0x0100
+.stub_src_end:
+
+    ; (Loading and execution handled by stub at 0x0008)
+
+.com_unknown:
+    ld de, msg_unknown
+    ld c, F_PSTR
+    call BDOS
+    ret
+
+
+; ==========================================================================
+; str_match — Case-insensitive match of (HL) against (DE)
+;   DE points to uppercase null-terminated command name.
+;   HL points to input text.
+;   Match succeeds if input starts with the command (followed by
+;   space, null, or end of input).
+;   Out: Z flag set if match
+;   Clobbers: AF
+; ==========================================================================
+; @proc str_match
+; @param %input:u16  hl
+; @param %pattern:u16 de
+; @out   zero
+; @clobbers af
+; @end
+str_match:
+    push hl
+    push de
+.loop:
+    ld a, (de)
+    or a
+    jr z, .end_pattern         ; End of pattern — check delimiter
+    ; Compare with input (case-insensitive)
+    ld a, (hl)
+    call to_upper
+    push af
+    ld a, (de)
+    ld b, a                    ; B = pattern char (already upper)
+    pop af                     ; A = input char (uppercased)
+    cp b
+    jr nz, .no_match
+    inc hl
+    inc de
+    jr .loop
+
+.end_pattern:
+    ; Pattern ended — input must be at space, null, or end
+    ld a, (hl)
+    or a
+    jr z, .match               ; Null = match
+    cp ' '
+    jr z, .match               ; Space = match
+    cp 0x0D
+    jr z, .match               ; CR = match
+    ; Fall through: no match (input has more chars)
+
+.no_match:
+    pop de
+    pop hl
+    or 1                       ; Clear Z flag
+    ret
+
+.match:
+    pop de
+    pop hl
+    xor a                      ; Set Z flag
+    ret
+
+
+; ------------------------------------------------------------------
+; to_upper — Convert A to uppercase if lowercase
+;   In:  A = character
+;   Out: A = uppercased character
+;   Clobbers: (none besides A)
+; ------------------------------------------------------------------
+; @proc to_upper
+; @param %ch:u8 a
+; @out   a
+; @end
+to_upper:
+    cp 'a'
+    ret c
+    cp 'z' + 1
+    ret nc
+    sub 0x20                   ; 'a' - 'A' = 0x20
+    ret
+
+
+; ==========================================================================
+; Data
+; ==========================================================================
+
+cold_flag: db 0                ; Set to 1 after first prompt
+
+; Command buffer for BDOS F10
+cmd_buf:
+    db 126                     ; Max characters
+    db 0                       ; Characters read (filled by BDOS)
+    ds 127                     ; Character data
+
+; Command names (uppercase, null-terminated)
+cmd_dir:    db "DIR", 0
+cmd_type:   db "TYPE", 0
+cmd_help:   db "HELP", 0
+cmd_screen: db "SCREEN", 0
+
+; Messages ('$' terminated for BDOS F9)
+msg_version:
+    db "CP/M 3.1 Mini-CCP v0.1", 0x0D, 0x0A, '$'
+
+msg_unknown:
+    db "?", 0x0D, 0x0A, '$'
+
+msg_no_files:
+    db "No files", 0x0D, 0x0A, '$'
+
+msg_crlf:
+    db 0x0D, 0x0A, '$'
+
+dir_sep:
+    db " : ", '$'
+
+msg_type_usage:
+    db "TYPE filename.ext", 0x0D, 0x0A, '$'
+
+msg_type_nf:
+    db "File not found", 0x0D, 0x0A, '$'
+
+msg_help:
+    db "Built-in commands:", 0x0D, 0x0A
+    db "  DIR    - Directory listing (wildcards: * ?)", 0x0D, 0x0A
+    db "  TYPE   - Display file", 0x0D, 0x0A
+    db "  SCREEN - Set/query screen width (32 or 51)", 0x0D, 0x0A
+    db "  HELP   - This help", 0x0D, 0x0A
+    db '$'
+
+str_screen_mode:  db "Mode: $"
+str_cols_crlf:    db " columns", 0x0D, 0x0A, '$'
+str_screen_usage: db "Usage: SCREEN 32|51", 0x0D, 0x0A, '$'
+
+; ------------------------------------------------------------------
+; print_hex16 — Print HL as 4-digit hex
+;   In: HL = value
+;   Clobbers: AF, BC, DE, HL
+; ------------------------------------------------------------------
+; @proc print_hex16
+; @param %val:u16 hl
+; @clobbers af,bc,de,hl
+; @end
+print_hex16:
+    ld a, h
+    call print_hex8
+    ld a, l
+    jp print_hex8
+
+; ------------------------------------------------------------------
+; print_hex8 — Print A as 2-digit hex
+;   In: A = value
+;   Clobbers: AF, BC, DE
+; ------------------------------------------------------------------
+; @proc print_hex8
+; @param %val:u8 a
+; @clobbers af,bc,de
+; @end
+print_hex8:
+    push af
+    rrca
+    rrca
+    rrca
+    rrca
+    call .nibble
+    pop af
+.nibble:
+    and 0x0F
+    add a, '0'
+    cp '9' + 1
+    jr c, .digit
+    add a, 'A' - '0' - 10
+.digit:
+    ld e, a
+    ld c, 2
+    jp BDOS
+
+; ------------------------------------------------------------------
+; print_crlf — Print CR+LF
+; ------------------------------------------------------------------
+; @proc print_crlf
+; @clobbers af,bc,de
+; @end
+print_crlf:
+    ld e, 0x0D
+    ld c, 2
+    call BDOS
+    ld e, 0x0A
+    ld c, 2
+    jp BDOS
+
+
+; ------------------------------------------------------------------
+; print_decimal_a — Print A as decimal (handles 0-99)
+;   In:  A = value
+;   Clobbers: AF, BC, DE
+; ------------------------------------------------------------------
+; @proc print_decimal_a
+; @param %val:u8 a
+; @clobbers af,bc,de
+; @end
+print_decimal_a:
+    ld b, 0
+.pda_tens:
+    sub 10
+    jr c, .pda_ones
+    inc b
+    jr .pda_tens
+.pda_ones:
+    add a, 10              ; A = ones digit
+    push af
+    ld a, b
+    or a
+    jr z, .pda_no_tens
+    add a, '0'
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+.pda_no_tens:
+    pop af
+    add a, '0'
+    ld e, a
+    ld c, F_COUT
+    jp BDOS
+
+
+; ------------------------------------------------------------------
+; parse_filename — Parse "FILENAME.EXT" at HL into type_fcb
+;   In: HL = pointer to null-terminated filename string
+;   Out: type_fcb filled, HL = first char after parsed name
+;        carry clear = OK, carry set = error
+;   Clobbers: AF, BC, DE, HL
+; ------------------------------------------------------------------
+; @proc parse_filename
+; @param %str:u16 hl
+; @out   carry
+; @clobbers af,bc,de,hl
+; @end
+parse_filename:
+    ; Strip optional "X:" drive prefix so we can handle commands like
+    ; "a:foo" or "B:TEST" — skip the prefix and remember the drive so
+    ; we can patch FCB byte 0 (drive: 0=default, 1=A, 2=B, ...) after
+    ; parse_fcb clears the FCB.
+    xor a
+    ld b, a                    ; B = drive override (0 = default)
+    ld a, (hl)
+    or a
+    jr z, .pf_do_parse         ; empty — let parse_fcb fail
+    ; Uppercase the first char in-place for comparison (we may back out)
+    cp 'a'
+    jr c, .pf_upper_done
+    cp 'z' + 1
+    jr nc, .pf_upper_done
+    sub 32
+.pf_upper_done:
+    cp 'A'
+    jr c, .pf_do_parse
+    cp 'P' + 1
+    jr nc, .pf_do_parse
+    ; A = uppercase drive letter candidate. Peek next char for ':'.
+    push af
+    inc hl
+    ld a, (hl)
+    cp ':'
+    jr z, .pf_got_drive
+    dec hl                     ; not "X:" — restore HL, discard drive
+    pop af
+    jr .pf_do_parse
+.pf_got_drive:
+    pop af
+    sub 'A' - 1                ; drive number 1=A, 2=B, ...
+    ld b, a
+    inc hl                     ; skip past ':'
+.pf_do_parse:
+    ld de, type_fcb
+    push bc
+    call parse_fcb             ; fills type_fcb; clears FCB byte 0; carry=error
+    pop bc
+    ret c                      ; propagate parse error
+    ld a, b
+    or a                       ; clears carry
+    ret z                      ; no drive override — success, carry clear
+    ld (type_fcb), a           ; patch FCB drive byte
+    or a                       ; clear carry (success)
+    ret
+
+; ------------------------------------------------------------------
+; parse_fcb — Parse "FILENAME.EXT" at HL into FCB at DE
+;   In: HL = pointer to null-terminated filename string
+;        DE = destination FCB (36 bytes)
+;   Out: FCB filled, HL = first char after parsed name (space/null)
+;        carry clear = OK, carry set = error
+;   Clobbers: AF, BC, DE, HL
+; ------------------------------------------------------------------
+; @proc parse_fcb
+; @param %str:u16 hl
+; @param %fcb:u16 de
+; @out   carry
+; @clobbers af,bc,de,hl
+; @end
+parse_fcb:
+    push hl
+    push de
+    ; Clear FCB to zeros
+    ld h, d
+    ld l, e
+    ld (hl), 0
+    push hl
+    inc de
+    ld bc, 35
+    ldir
+    pop hl                     ; HL = FCB base
+
+    ; Fill name+ext fields (bytes 1-11) with spaces
+    inc hl                     ; HL = &FCB[1]
+    push hl
+    ex de, hl                  ; DE = &FCB[1]
+    ld b, 11
+    ld a, ' '
+.fill_sp:
+    ld (de), a
+    inc de
+    djnz .fill_sp
+    pop de                     ; DE = &FCB[1] (name start)
+
+    pop hl                     ; Restore saved DE (FCB base, not needed)
+    pop hl                     ; Restore source string pointer
+
+    ; Skip leading spaces
+.skip_spaces:
+    ld a, (hl)
+    cp ' '
+    jr nz, .parse_name_start
+    inc hl
+    jr .skip_spaces
+
+.parse_name_start:
+    ; Check for drive prefix (e.g., "B:")
+    ld a, (hl)
+    call to_upper
+    sub 'A'
+    cp 16
+    jr nc, .no_drive_prefix
+    push af
+    inc hl
+    ld a, (hl)
+    cp ':'
+    jr nz, .not_drive_colon
+    pop af
+    inc a                       ; FCB drive: 1=A:, 2=B:, etc.
+    dec de                      ; DE → FCB[0]
+    ld (de), a
+    inc de                      ; DE → FCB[1] again
+    inc hl                      ; Skip past ':'
+    jr .parse_name_go
+.not_drive_colon:
+    pop af
+    dec hl                      ; Back to the letter
+.no_drive_prefix:
+.parse_name_go:
+    push de                    ; Save &FCB[1]
+
+    ; Parse name part (up to 8 chars, stop at '.', null, or space)
+    ld b, 8
+.parse_name:
+    ld a, (hl)
+    or a
+    jr z, .parse_done
+    cp ' '
+    jr z, .parse_done
+    cp '.'
+    jr z, .parse_dot
+    cp '?'
+    jr z, .pfn_store
+    cp '*'
+    jr z, .pfn_star
+    call to_upper
+.pfn_store:
+    ld (de), a
+    inc hl
+    inc de
+    djnz .parse_name
+    jr .skip_name
+.pfn_star:
+    ld a, '?'
+    ld (de), a
+    inc de
+    djnz .pfn_star
+.skip_name:
+    ld a, (hl)
+    or a
+    jr z, .parse_done
+    cp '.'
+    jr z, .parse_dot
+    cp ' '
+    jr z, .parse_done
+    inc hl
+    jr .skip_name
+
+.parse_dot:
+    inc hl                     ; Skip the '.'
+    pop de                     ; DE = &FCB[1]
+    push de                    ; Re-save for .parse_done
+    ; Advance DE to extension field: FCB[1] + 8 = FCB[9]
+    ld a, 8
+    add a, e
+    ld e, a
+    jr nc, .no_ext_carry
+    inc d
+.no_ext_carry:
+    ld b, 3
+.parse_ext:
+    ld a, (hl)
+    or a
+    jr z, .parse_done
+    cp ' '
+    jr z, .parse_done
+    cp '?'
+    jr z, .pfe_store
+    cp '*'
+    jr z, .pfe_star
+    call to_upper
+.pfe_store:
+    ld (de), a
+    inc hl
+    inc de
+    djnz .parse_ext
+    jr .parse_done
+.pfe_star:
+    ld a, '?'
+    ld (de), a
+    inc de
+    djnz .pfe_star
+
+.parse_done:
+    ; Check we got at least one character
+    pop de                     ; DE = &FCB[1]
+    ld a, (de)
+    cp ' '
+    jr z, .parse_fail
+    or a                       ; Clear carry = success
+    ret
+.parse_fail:
+    scf
+    ret
+
+
+; FCB for TYPE command
+type_fcb:
+    ds 36
+
+; DIR state
+cur_drive:        db 0               ; Current drive (0=A:)
+dir_maxcols:      db 3               ; Columns for DIR display
+dir_display_drive: db 0              ; Drive to display in prefix (0=A:)
+
+; SCREEN command data
+scr_query_pb:
+    db 0x1A, 0                   ; SCB offset=conwidth (0x1A), op=0 (get)
+screen_biospb:
+    db 32, 0, 0, 0, 0, 0, 0, 0  ; func=32, A=cols (patched at runtime), rest 0
+
+; FCB for DIR command
+dir_fcb:
+    ds 36
+
+; Stack
+    ds 64
+ccp_stack:

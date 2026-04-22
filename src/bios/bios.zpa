@@ -1,0 +1,927 @@
+; ==========================================================================
+; CP/M 3.1 BIOS for ZX Spectrum +3 — Banked Architecture
+; ==========================================================================
+;
+; Memory layout:
+;   TPA (mode 0: banks 0,1,2,3):
+;     0000-00FF   Page zero (JP stubs to common memory)
+;     0100-F9FF   TPA (~63K)
+;     FA00-FFFF   Common memory stub (bank 3, always visible)
+;
+;   System (mode 3: banks 4,7,6,3):
+;     0000-3FFF   Bank 4 — BIOS, BDOS, drivers, font, buffers
+;     4000-7FFF   Bank 7 — System data / growth
+;     8000-BFFF   Bank 6 — Reserved for growth
+;     FA00-FFFF   Common memory stub (bank 3, always visible)
+;
+;   Screen access (mode 2: banks 4,5,6,3):
+;     4000-7FFF   Bank 5 — Screen RAM (paged in temporarily)
+;
+; The loader places CPM3.SYS at C000h (bank 3). The init code below
+; copies the system image to bank 4 and the common stub to FA00h,
+; then jumps to cold_boot in bank 4.
+;
+; Assembled with:
+;   sjasmplus --raw=build/bios.bin src/bios/bios.asm
+;
+; ==========================================================================
+
+    device zxspectrum128
+    org 0xC000
+
+; --- Port definitions (global, used by all sections) ---
+PORT_1FFD   equ 0x1FFD
+PORT_FDC_ST equ 0x2FFD             ; FDC main status register (read)
+PORT_FDC_DT equ 0x3FFD             ; FDC data register (read/write)
+PORT_ULA    equ 0xFE
+
+; --- Banking modes ---
+; Bank 0 (TPA):    mode 0 — banks 0,1,2,3
+; Bank 1 (system): mode 3 — banks 4,7,6,3
+; Screen access:   mode 2 — banks 4,5,6,3 (temporary, for bank 5)
+BANK0_1FFD  equ 0x01              ; Special mode 0, motor off
+BANK1_1FFD  equ 0x07              ; Special mode 3, motor off
+MOTOR_BIT   equ 0x08              ; OR this in for motor on
+
+; --- CP/M constants ---
+CCP_ADDR    equ 0x0100            ; CCP loads here in TPA
+JMP_OPCODE  equ 0xC3              ; JP instruction
+
+
+; ######################################################################
+; INIT — One-shot setup code (runs at C000h, copies code to banks)
+; ######################################################################
+
+; @proc init
+; @clobbers af,bc,de,hl
+; @end
+init:
+    di
+
+    ; ---- Install common memory stub at FA00h (bank 3) ----
+    ; common_image sits at F591..FB50 (file layout), needs to land at FA00..FFBF.
+    ; Ranges overlap (FA00..FB50), so we MUST use backward copy (LDDR).
+_copy_common_size equ common_image_end - common_image
+    assert common_image < 0xFA00, "common_image must be below FA00"
+    ; LDDR (backward copy) is always safe regardless of overlap direction
+    ld hl, common_image + _copy_common_size - 1
+    ld de, 0xFA00 + _copy_common_size - 1
+    ld bc, _copy_common_size
+    lddr
+
+    ; ---- Copy system code to bank 4 at 0000h ----
+    ; We're in mode 2 (loader left us here): bank 4 @ 0000, bank 3 @ C000
+_copy_sys_size equ system_image_end - system_image
+    assert system_image >= (0x0000 + _copy_sys_size), "LDIR safe: no overlap (src >= dst+count)"
+    ld hl, system_image
+    ld de, 0x0000
+    ld bc, _copy_sys_size
+    ldir
+
+    ; ---- Jump to cold_boot (now live in bank 4) ----
+    jp cold_boot
+
+
+; ######################################################################
+; SYSTEM CODE — Lives in bank 4 (0000-3FFF)
+; ######################################################################
+;
+; Assembled with PHASE 0x0000 so labels resolve to bank 4 addresses.
+; The init code copies these bytes from C000+offset to 0000.
+
+system_image:
+    PHASE 0x0000
+
+; ==========================================================================
+; BIOS Jump Table — 33 entry points, 3 bytes each (JP addr)
+; ==========================================================================
+
+bios_base:
+fn_boot:  jp cold_boot            ; 0: Cold start
+fn_wboot: jp warm_boot            ; 1: Warm start
+fn_const: jp con_status            ; 2: Console input status
+fn_conin: jp con_in                ; 3: Console input
+fn_cono:  jp con_out               ; 4: Console output
+fn_list:  jp list_out              ; 5: List (printer) output
+fn_auxo:  jp aux_out               ; 6: Aux output
+fn_auxi:  jp aux_in                ; 7: Aux input
+fn_home:  jp disk_home             ; 8: Home disk
+fn_sldsk: jp sel_disk              ; 9: Select disk
+fn_sttrk: jp set_trk               ; 10: Set track
+fn_stsec: jp set_sec               ; 11: Set sector
+fn_stdma: jp set_dma               ; 12: Set DMA address
+fn_read:  jp disk_read             ; 13: Read sector
+fn_write: jp disk_write            ; 14: Write sector
+fn_lists: jp list_status           ; 15: List output status
+fn_sctrn: jp sec_trn               ; 16: Sector translate
+fn_conos: jp con_out_status        ; 17: Console output status
+fn_auxis: jp aux_in_status         ; 18: Aux input status
+fn_auxos: jp aux_out_status        ; 19: Aux output status
+fn_dvtbl: jp dev_tbl               ; 20: Device table
+fn_devin: jp dev_init              ; 21: Device init
+fn_drtbl: jp drv_tbl               ; 22: Drive table
+fn_mltio: jp multi_io              ; 23: Multi-sector count
+fn_flush: jp flush_buf             ; 24: Flush buffers
+fn_mov:   jp bios_move             ; 25: Block move
+fn_tim:   jp bios_time             ; 26: Time/date
+fn_bnksl: jp bank_sel              ; 27: Bank select (in common memory)
+fn_stbnk: jp set_bnk               ; 28: Set DMA bank
+fn_xmov:  jp bios_xmove            ; 29: Set move banks
+        jp 0                     ; 30: reserved
+        jp 0                     ; 31: reserved
+fn_scrm: jp scr_set_cols          ; 32: SCRMODE — set column count (A=32 or 51)
+
+
+; ==========================================================================
+; System state (bank 4)
+; ==========================================================================
+dma_bank:     db 0                 ; Bank for disk DMA operations
+xmove_src:    db 0                 ; Source bank for next ?move
+xmove_dst:    db 0                 ; Dest bank for next ?move
+xmove_active: db 0                 ; 1 = inter-bank move pending
+
+; Disk state
+disk_drive:   db 0                 ; Currently selected drive
+disk_head:    db 0                 ; Physical head (0 or 1; set by ensure_sector)
+disk_track:   dw 0                 ; Current track
+disk_sector:  dw 0                 ; Current sector
+disk_dma:     dw 0                 ; Current DMA address
+multi_count:  db 0                 ; Multi-sector count
+
+
+; ==========================================================================
+; COLD BOOT — System startup
+;
+; @proc cold_boot
+; @clobbers af,bc,de,hl
+; @end
+cold_boot:
+    di
+    ld sp, bdos_stack              ; Use common-memory stack
+
+    ; Initialize drivers
+    call scr_init                  ; Screen: clear, set attributes
+    call kbd_init                  ; Keyboard: reset state
+    call fdc_init                  ; FDC: recalibrate drive
+    call load_fonts                ; Load fonts from disk into bank 7
+    call motor_off                 ; Spin drive down before CCP takes over
+
+    ; Print signon
+    ld hl, signon_msg
+    call print_str(hl)
+
+    ; Initialize state
+    xor a
+    ld (xmove_active), a
+    ld (dma_bank), a
+    ld (multi_count), a
+
+    ; Set up ISR vector in bank 4 (system mode uses bank 4 at 0x0000)
+    ld a, 0xC3                     ; JP opcode
+    ld (0x0038), a
+    ld hl, isr_handler
+    ld (0x0039), hl
+
+    ; Patch SCB dynamic fields
+    ld hl, scb_base
+    ld (scb_common), hl            ; SCB[0x3A] = common memory base
+    ld hl, bdos_stub
+    ld (scb_tpa), hl               ; SCB[0x62] = top of TPA
+
+    ; Fall through to warm boot (loads CCP and starts it)
+
+
+; ==========================================================================
+; WARM BOOT — Reload CCP after program exit
+;
+; @proc warm_boot
+; @clobbers af,bc,de,hl
+; @end
+warm_boot:
+    di
+    ld sp, bdos_stack
+
+    ; Copy embedded CCP from bank 4 to TPA at 0100h via inter-bank copy
+    ld hl, ccp_stored              ; Source: bank 4
+    ld de, CCP_ADDR                ; Dest: 0100h in bank 0
+    ld bc, ccp_stored_end - ccp_stored
+    call copy_block_to_tpa(hl, de, bc)
+
+    ; Set default DMA to 0080h
+    ld bc, 0x0080
+    ld (disk_dma), bc
+
+    ; Reset state
+    xor a
+    ld (xmove_active), a
+    ld (dma_bank), a
+    ld (multi_count), a
+
+    ; Switch to TPA, set up page zero, start CCP
+    jp start_tpa                   ; Common-memory routine (never returns)
+
+
+; ==========================================================================
+; Console I/O
+; ==========================================================================
+
+; @proc con_status
+; @out a                           ; 0xFF = ready, 0x00 = not ready
+; @clobbers af,bc,de,hl
+; @end
+con_status:
+    jp kbd_status
+
+; @proc con_in
+; @out a                           ; character
+; @clobbers af,bc,de,hl
+; @end
+con_in:
+    jp kbd_getchar
+
+; @proc con_out
+; @param %char:u8  c               ; character to output
+; @clobbers af,bc,de,hl,ix
+; @end
+con_out:
+    ld a, %char
+    jp scr_putchar
+
+; @proc con_out_status
+; @out a                           ; 0xFF (always ready)
+; @end
+con_out_status:
+    jp scr_status
+
+
+; ==========================================================================
+; List / Aux — Stubbed (no printer or serial port)
+; ==========================================================================
+
+; @proc list_out
+; @end
+list_out:
+; @proc aux_out
+; @end
+aux_out:
+    ret
+
+; @proc aux_in
+; @out a                           ; 0x1A (EOF)
+; @end
+aux_in:
+    ld a, 0x1A                     ; Return EOF
+    ret
+
+; @proc list_status
+; @out a
+; @end
+list_status:
+; @proc aux_in_status
+; @out a
+; @end
+aux_in_status:
+; @proc aux_out_status
+; @out a                           ; 0 (not ready)
+; @end
+aux_out_status:
+    xor a                          ; Not ready
+    ret
+
+; @proc dev_init
+; @end
+dev_init:
+    ret
+
+
+; ==========================================================================
+; Device and Drive Tables
+; ==========================================================================
+
+; @proc dev_tbl
+; @out hl                          ; pointer to char_dev_table
+; @end
+dev_tbl:
+    ld hl, char_dev_table
+    ret
+
+char_dev_table:
+    db 'CON   '                    ; Device name (6 chars)
+    db 0x03                        ; Mode: input + output
+    db 0                           ; Baud: N/A
+    db 0                           ; Table terminator
+
+; @proc drv_tbl
+; @out hl                          ; pointer to drive_table
+; @end
+drv_tbl:
+    ld hl, drive_table
+    ret
+
+; drive_table moved to common memory (common.zpa) so TPA programs can
+; dereference it — label resolves to its common-memory address.
+
+
+; ==========================================================================
+; Disk Operations
+; ==========================================================================
+
+; @proc disk_home
+; @clobbers bc
+; @end
+disk_home:
+    ld bc, 0
+    ; Fall through to set_trk
+
+; @proc set_trk
+; @param %track:u16  bc
+; @end
+set_trk:
+    ld (disk_track), %track
+    ret
+
+; @proc set_sec
+; @param %sector:u16  bc
+; @end
+set_sec:
+    ld (disk_sector), %sector
+    ret
+
+; @proc set_dma
+; @param %dma:u16  bc
+; @end
+set_dma:
+    ld (disk_dma), %dma
+    ret
+
+; @proc sel_disk
+; @param %drive:u8  c              ; drive number (0=A:)
+; @param %login:u8  e              ; E bit 0 = 0 → first selection → run fdc_login
+; @out   hl                        ; DPH address (0 = invalid)
+; @clobbers af,bc,de
+; @end
+;
+; Per CP/M 3 BIOS convention: E bit 0 = 0 means this is the first SELDSK
+; for the drive since cold boot, warm reset, or BDOS fn 37 (reset disk);
+; bit 0 = 1 means it's already been logged in this session. We probe the
+; disc geometry only on the first-select case so normal file I/O never
+; re-reads the boot sector. fdc_login self-gates via the XDPB Freeze byte
+; as a second safety net — a redundant call is one byte-compare + ret z.
+;
+; The BDOS (select_drive) also calls fdc_login explicitly on its own
+; first-login path; this hook covers TPA programs that drive SELDSK
+; directly (FORMAT, DISCKIT, SHOWXDPB, etc.) so they don't read stale
+; defaults out of xdpb_a / xdpb_b.
+sel_disk:
+    ld a, %drive
+    cp 2
+    jr nc, .bad_drive              ; Only drives 0 (A:) and 1 (B:) exist
+    ld (disk_drive), a
+    bit 0, %login
+    jr nz, .pick_dph               ; bit 0 = 1 → already logged in → fast path
+    push ix                        ; fdc_login uses IX; TPA callers may rely on it
+    call fdc_login
+    pop ix
+.pick_dph:
+    ld a, (disk_drive)
+    or a
+    jr nz, .is_b
+    ld hl, xdph_a
+    ret
+.is_b:
+    ld hl, xdph_b
+    ret
+.bad_drive:
+    ld hl, 0
+    ret
+
+; @proc disk_read
+; @out a                           ; 0=ok, 1=error
+; @clobbers af,bc,de,hl
+; @end
+disk_read:
+    jp fdc_read
+
+; @proc disk_write
+; @out a                           ; 0=ok, 1=error, 2=read-only
+; @clobbers af,bc,de,hl
+; @end
+disk_write:
+    jp fdc_write
+
+; @proc sec_trn
+; @param %lsec:u16  bc             ; logical sector
+; @param %tbl:u16   de             ; translate table (ignored: 1:1)
+; @out   hl                        ; physical sector
+; @end
+sec_trn:
+    ld l, c                        ; no translation: physical = logical (c = low byte of %lsec)
+    ld h, b
+    ret
+
+; @proc multi_io
+; @param %count:u8  a
+; @end
+multi_io:
+    ld (multi_count), %count
+    ret
+
+; @proc flush_buf
+; @out a                           ; 0 = success
+; @end
+flush_buf:
+    xor a                          ; Success
+    ret
+
+; @proc set_bnk
+; @param %bank:u8  a
+; @end
+set_bnk:
+    ld (dma_bank), %bank
+    ret
+
+
+; ==========================================================================
+; Block Move / Cross-bank Move
+; ==========================================================================
+
+; @proc bios_move
+; @param %dst:u16   hl
+; @param %src:u16   de
+; @param %count:u16 bc
+; @out   hl                        ; advanced past moved data
+; @out   de                        ; advanced past moved data
+; @clobbers af,bc
+; @end
+bios_move:
+    ld a, (xmove_active)
+    or a
+    jp nz, interbank_move          ; → common memory routine
+
+    ; Same-bank move: just LDIR
+    ldir
+    ret
+
+; @proc bios_xmove
+; @param %dst_bank:u8  b           ; destination bank number
+; @param %src_bank:u8  c           ; source bank number
+; @clobbers af
+; @end
+bios_xmove:
+    ld a, %src_bank
+    ld (xmove_src), a
+    ld a, %dst_bank
+    ld (xmove_dst), a
+    ld a, 1
+    ld (xmove_active), a
+    ret
+
+
+; ==========================================================================
+; Time — Read/write SCB time fields
+;
+; @proc bios_time
+; @param %mode:u8  c               ; 0 = get, 0FFh = set
+; @end
+bios_time:
+    ret
+
+
+; ==========================================================================
+; XBIOS dispatch — called from common-memory userf_stub with A = func_id
+; and caller's registers already switched to system bank by bios_call_bank4.
+; Only non-CD_VERSION IDs reach here; CD_VERSION is handled inline in the
+; common stub to save a bank switch on the hot path.
+; ==========================================================================
+; @proc xbios_handler
+; @param %func_id:u8 a
+; @out   af bc de hl
+; @end
+xbios_handler:
+    cp 0xE3
+    jr z, .cd_version
+    cp 0xE6
+    jr z, .cd_info
+    cp 0xC5
+    jr z, .te_stl_ask
+    cp 0xC8
+    ret z                          ; TE_STL_ON_OFF — swallow, no status line
+    cp 0x98
+    jr z, .dd_drive_status
+    ld a, 0xFF                     ; unknown XBIOS ID
+    ret
+
+.cd_version:
+    ; CD_VERSION (0x00E3): A=machine type, B=major, C=minor.
+    ld a, 3
+    ld bc, 0x0100
+    ret
+
+.cd_info:
+    ; CD_INFO (0x00E6): hardware configuration.
+    ;   A = 0x00 (one drive)
+    ;   B = 8    (128K in 16K pages)
+    ;   C = 0x00 (no serial)
+    ;   D = 0x00 (drive B absent)
+    ;   E = 0x15 (drive A: SS, 40-track, 3-inch)
+    ;   HL = address of a buffer-descriptor table terminated by 0xFF
+    ld bc, 0x0800
+    ld de, 0x0015
+    ld hl, .buftab
+    xor a
+    ret
+
+.te_stl_ask:
+    ; TE_STL_ASK (0x00C5): status line always off on our driver.
+    ;   A = 0x00 (disabled), Zero flag set
+    xor a
+    ret
+
+.dd_drive_status:
+    ; DD_DRIVE_STATUS (0x0098): SENSE DRIVE STATUS, return ST3 in A.
+    ;   In:  C = bits 1-0 unit, bit 2 head
+    ;   Out: A = µPD765A ST3 byte
+    ;          bit 7 Fault, bit 6 WP, bit 5 Ready, bit 4 T0
+    ;          bit 3 Two-Sided, bit 2 Head, bits 1-0 Unit
+    ; Drive A (unit 0): report Ready + T0 + single-sided + drive A.
+    ; Drive B (unit 1): not fitted — Ready and WP both clear (per spec).
+    ld a, c
+    and 0x03                       ; isolate unit number
+    or a
+    jr nz, .drive_absent
+    ; Unit 0 (drive A): Ready | Track0 | unit-0
+    ld a, 0x30                     ; bit 5 = Ready, bit 4 = Track 0
+    ret
+.drive_absent:
+    ; Unit 1 (or higher): drive not fitted.
+    ld a, 0x01                     ; unit bit set, Ready=0, WP=0
+    ret
+
+.buftab:
+    db 0xFF                        ; empty buffer-table terminator
+
+
+; ==========================================================================
+; Utility
+; ==========================================================================
+
+; @proc print_str
+; @param %str:u16  hl              ; pointer to null-terminated string
+; @clobbers af,bc,de,hl,ix
+; @end
+print_str:
+    ld a, (%str)
+    or a
+    ret z
+    ld c, a
+    push %str
+    call con_out
+    pop %str
+    inc %str
+    jr print_str
+
+BUILD_NUM equ 109
+
+TPA_KB equ (bdos_stub - 0x0100) / 1024
+
+signon_msg:
+    db 0x0D, 0x0A
+    db "Open CP/M +3 (Build "
+    LUA ALLPASS
+    local bn = _c("BUILD_NUM")
+    local hx = "0123456789ABCDEF"
+    local h = function(n) return hx:sub(n+1,n+1) end
+    _pc("db '" .. h(bn >> 8) .. h((bn >> 4) & 0xF) .. h(bn & 0xF) .. "'")
+    ENDLUA
+    db "), "
+    db '0' + (TPA_KB / 10) % 10
+    db '0' + TPA_KB % 10
+    db "K TPA", 0x0D, 0x0A
+    db 0x0D, 0x0A
+    db 0
+
+
+; ==========================================================================
+; Screen driver (includes font data)
+; ==========================================================================
+
+    include "screen.asm"
+
+; ==========================================================================
+; Keyboard driver
+; ==========================================================================
+
+    include "keyboard.asm"
+
+; ==========================================================================
+; FDC disk driver
+; ==========================================================================
+
+    include "fdc765.asm"
+
+
+; ==========================================================================
+; load_fonts — Read FONT51.BIN and FONT32.BIN from disk into bank 7
+;   Scans the CP/M directory (track 1, physical sectors 1-4) for the two
+;   font files and loads them into bank 7 (always-visible in system mode):
+;     FONT51.BIN → 0x4000 (5px-wide, used for 51-col mode)
+;     FONT32.BIN → 0x4800 (8px-wide, used for 32-col mode)
+;   Called from cold_boot after fdc_init; motor is already on.
+;   In:  nothing
+;   Out: nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc load_fonts
+; @clobbers af,bc,de,hl
+; @end
+load_fonts:
+    xor a
+    ld (disk_drive), a              ; drive A:
+    ld (_lf_found), a
+    ld (_font51_blk0), a
+    ld (_font51_blk1), a
+    ld (_font32_blk0), a
+    ld (_font32_blk1), a
+
+    ; Seek to track 1 (first data track: OFF=1)
+    ld a, 1
+    call fdc_seek
+
+    ; Scan 4 physical sectors (sectors 1-4) = 64 directory entries
+    ld bc, 1                        ; B=0 (only C used; B initialized so push bc below is defined)
+.lf_dsec:
+    ld a, c
+    cp 5
+    jr nc, .lf_dsec_done
+    push bc
+    call fdc_read_sector            ; → deblock_buf
+    pop bc
+    jr nz, .lf_dsec_done            ; I/O error — abort
+
+    push bc
+    ld hl, deblock_buf
+    ld b, 16                        ; 16 entries per sector
+.lf_dent:
+    push bc
+    push hl
+    call _lf_check_entry
+    pop hl
+    pop bc
+    ld de, 32
+    add hl, de
+    djnz .lf_dent
+    pop bc
+
+    ld a, (_lf_found)
+    cp 3
+    jr z, .lf_dsec_done             ; found both — done early
+    inc c
+    jr .lf_dsec
+
+.lf_dsec_done:
+    ld hl, _font51_blk0
+    ld de, 0x8000
+    call _lf_load_file              ; load font51 → bank 6 at 0x8000
+
+    ld hl, _font32_blk0
+    ld de, 0x8800
+    call _lf_load_file              ; load font32 → bank 6 at 0x8800
+    ret
+
+
+; _lf_check_entry — If HL is a FONT51/FONT32 dir entry, record its blocks
+;   In:  HL = 32-byte directory entry
+;   Clobbers: AF, BC, DE, HL
+; @proc _lf_check_entry
+; @clobbers af,bc,de,hl
+; @end
+_lf_check_entry:
+    ld a, (hl)
+    or a
+    ret nz                          ; user != 0 — skip
+
+    push hl
+    inc hl                          ; HL = entry[1..11] (name+ext)
+    ld de, _lf_name51
+    ld b, 11
+    call _lf_cmp11                  ; Z if match
+    pop hl
+    jr nz, .lf_try32
+
+    ld a, (_lf_found)
+    bit 0, a
+    jr nz, .lf_done                 ; already have font51 blocks
+    push hl
+    ld bc, 16
+    add hl, bc                      ; HL = &entry[16] = AL[0]
+    ld a, (hl)
+    ld (_font51_blk0), a
+    inc hl
+    ld a, (hl)
+    ld (_font51_blk1), a
+    pop hl
+    ld a, (_lf_found)
+    or 0x01
+    ld (_lf_found), a
+    jr .lf_done
+
+.lf_try32:
+    push hl
+    inc hl
+    ld de, _lf_name32
+    ld b, 11
+    call _lf_cmp11
+    pop hl
+    jr nz, .lf_done
+
+    ld a, (_lf_found)
+    bit 1, a
+    jr nz, .lf_done
+    push hl
+    ld bc, 16
+    add hl, bc
+    ld a, (hl)
+    ld (_font32_blk0), a
+    inc hl
+    ld a, (hl)
+    ld (_font32_blk1), a
+    pop hl
+    ld a, (_lf_found)
+    or 0x02
+    ld (_lf_found), a
+
+.lf_done:
+    ret
+
+
+; _lf_cmp11 — Compare 11 bytes (HL) vs (DE), masking attribute bits
+;   In:  HL = source, DE = reference, B = 11
+;   Out: Z if all 11 bytes match, NZ on first mismatch
+;   Clobbers: AF, BC, DE, HL
+; @proc _lf_cmp11
+; @out   zero
+; @clobbers af,bc,de,hl
+; @end
+_lf_cmp11:
+    ld a, (hl)
+    and 0x7F                        ; strip attribute bit
+    ld c, a
+    ld a, (de)
+    cp c
+    ret nz
+    inc hl
+    inc de
+    djnz _lf_cmp11
+    ret                             ; Z set from last cp (all matched)
+
+
+; _lf_load_file — Load 2 × 1K blocks from disk to destination DE
+;   In:  HL = pointer to [blk0, blk1] byte array
+;        DE = destination address (in bank 7)
+;   Clobbers: AF, BC, DE, HL
+; @proc _lf_load_file
+; @clobbers af,bc,de,hl
+; @end
+_lf_load_file:
+    ld b, 2                         ; 2 × 1K blocks per font file
+.lf_blk:
+    push bc
+    push hl
+    ld a, (hl)
+    or a
+    jr z, .lf_blk_skip              ; block 0 = not allocated (file not found)
+    call _lf_load_block             ; reads 1K to DE, advances DE by 1024
+.lf_blk_skip:
+    pop hl
+    inc hl
+    pop bc
+    djnz .lf_blk
+    ret
+
+
+; _lf_load_block — Read one 1K block (2 physical sectors) to DE
+;   In:  A = CP/M block number (2..174), DE = destination
+;   Out: DE advanced by 1024
+;   Clobbers: AF, BC, HL
+; @proc _lf_load_block
+; @clobbers af,bc,de,hl
+; @end
+_lf_load_block:
+    ld l, a
+    ld h, 0
+    add hl, hl                      ; HL = block * 2 = first abs physical sector
+    ld (_lf_abs_phys), hl
+
+    ld b, 2                         ; 2 physical sectors per 1K block
+.lf_phys:
+    push bc
+    push de
+    ld hl, (_lf_abs_phys)
+    call _lf_div9                   ; B = HL/9 (quotient), A = HL%9 (remainder)
+    inc a                           ; sector ID = remainder + 1
+    ld (_lf_sec_id), a              ; save across fdc_seek (avoids push/pop)
+    ld a, b
+    inc a                           ; track = quotient + OFF (OFF=1)
+    call fdc_seek                   ; clobbers AF, BC, DE, HL
+    ld a, (_lf_sec_id)
+    call fdc_read_sector            ; → deblock_buf; clobbers AF, BC, DE, HL
+    pop de                          ; DE = destination
+    ld hl, deblock_buf
+    ld bc, 512
+    ldir                            ; copy 512B; DE += 512 automatically
+    ld hl, (_lf_abs_phys)
+    inc hl
+    ld (_lf_abs_phys), hl
+    pop bc
+    djnz .lf_phys
+    ret
+
+
+; _lf_div9 — Divide HL by 9 via repeated subtraction
+;   In:  HL = dividend (0..349 for our block range)
+;   Out: B = quotient, A = remainder
+;   Clobbers: AF, BC, HL
+; @proc _lf_div9
+; @out   b,a
+; @clobbers af,bc,hl
+; @end
+_lf_div9:
+    ld b, 0
+.lf_d9:
+    ld a, h
+    or a
+    jr nz, .lf_d9_sub               ; HL >= 256 → definitely >= 9
+    ld a, l
+    cp 9
+    jr c, .lf_d9_done               ; HL < 9 → done
+.lf_d9_sub:
+    ld a, l
+    sub 9
+    ld l, a
+    jr nc, .lf_d9_nb
+    dec h
+.lf_d9_nb:
+    inc b
+    jr .lf_d9
+.lf_d9_done:
+    ld a, l                         ; A = remainder
+    ret
+
+
+; --- Font loader data ---
+_lf_found:    db 0                  ; bit 0=font51 found, bit 1=font32 found
+_font51_blk0: db 0                  ; first block number of FONT51.BIN
+_font51_blk1: db 0                  ; second block number
+_font32_blk0: db 0                  ; first block number of FONT32.BIN
+_font32_blk1: db 0
+_lf_abs_phys: dw 0                  ; scratch: current absolute physical sector
+_lf_sec_id:   db 0                  ; scratch: sector ID saved across fdc_seek
+_lf_name51:   db "FONT51  BIN"      ; 11-char CP/M name (6+2spaces+3ext)
+_lf_name32:   db "FONT32  BIN"
+
+
+; ==========================================================================
+; Embedded CCP (copied to 0100h on warm/cold boot via inter-bank copy)
+; ==========================================================================
+
+ccp_stored:
+    incbin "miniccp.bin"
+ccp_stored_end:
+
+
+; ==========================================================================
+; BDOS
+; ==========================================================================
+
+    include "bdos.asm"
+
+
+; ==========================================================================
+system_end:
+    assert system_end <= 0x4000, "System code exceeds bank 4 (16K)!"
+
+    DEPHASE
+system_image_end:
+
+
+; ######################################################################
+; COMMON MEMORY STUB — Lives at FA00-FFFF (bank 3, always visible)
+; ######################################################################
+;
+; Assembled with PHASE 0xFA00 so labels resolve to common memory addresses.
+; The init code copies these bytes from the binary to FA00h.
+
+common_image:
+    PHASE 0xFA00
+
+    include "common.asm"
+
+    DEPHASE
+common_image_end:
+
+
+; ######################################################################
+; End of CPM3.SYS image
+; ######################################################################
+
+    assert $ <= 0x10000, "CPM3.SYS image overflows bank 3!"

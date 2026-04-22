@@ -1,0 +1,501 @@
+; ==========================================================================
+; CP/M 3.1 Keyboard Driver for ZX Spectrum +3
+; ==========================================================================
+;
+; The Spectrum keyboard is an 8×5 matrix read via port 0xFE.
+; High byte of port address selects the half-row (active-low).
+; Bits 0-4 of result = 5 keys (0 = pressed).
+;
+;   Addr   Row  Bit0       Bit1    Bit2   Bit3   Bit4
+;   0xFEFE  0   CapsShift  Z       X      C      V
+;   0xFDFE  1   A          S       D      F      G
+;   0xFBFE  2   Q          W       E      R      T
+;   0xF7FE  3   1          2       3      4      5
+;   0xEFFE  4   0          9       8      7      6
+;   0xDFFE  5   P          O       I      U      Y
+;   0xBFFE  6   Enter      L       K      J      H
+;   0x7FFE  7   Space      SymShft M      N      B
+;
+; Raw key code = row*5 + bit (0-39).
+; Modifiers: CapsShift = raw 0, SymShift = raw 36.
+;
+; Shift modes:
+;   None:       lowercase letters, digits, Enter, Space
+;   Caps:       UPPERCASE, Caps+0=BS, Caps+Space=Ctrl-C
+;   Symbol:     punctuation (! @ # $ % etc.)
+;   Caps+Sym:   Ctrl codes (Ctrl-A through Ctrl-Z)
+;
+; ==========================================================================
+
+; --- Constants ---
+; Keyboard uses same port as ULA: 0xFE (PORT_ULA defined in bios.asm)
+PORT_KBD      equ PORT_ULA
+
+; Repeat counters tick once per _kbd_scan. kbd_getchar gates scans behind
+; `ei; halt; di`, so in the normal blocking path scans happen once per IM 1
+; interrupt = 50Hz = ~20ms per scan.
+;   25 iters ≈ 500ms initial delay
+;    3 iters ≈  60ms repeat rate (~17 cps)
+REPEAT_DELAY  equ 25
+REPEAT_RATE   equ 3
+
+
+; --- Variables ---
+kbd_last_raw:   db 0xFF        ; Last raw key (0-39), 0xFF = none
+kbd_rep_count:  dw 0           ; 16-bit repeat countdown
+kbd_key_ready:  db 0           ; 1 = key in buffer
+kbd_key_buf:    db 0           ; Buffered ASCII code
+kbd_mods:       db 0           ; Saved modifier state for repeat
+kbd_settle:     db 0           ; Debounce: 1 = waiting for settle scan
+
+; Inject buffer — write text here, set kbd_inject_len, reset kbd_inject_rd.
+; kbd_getchar drains this before polling the real keyboard.
+; Layout: buf[64], len, rd (consecutive so emutil can write in one call).
+kbd_inject_buf: ds 64          ; Up to 64 ASCII bytes to inject
+kbd_inject_len: db 0           ; Bytes remaining in buffer
+kbd_inject_rd:  db 0           ; Read offset into buf (0-63)
+
+
+; ==========================================================================
+; kbd_init — Initialize keyboard driver
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, HL
+; ==========================================================================
+; @proc kbd_init
+; @clobbers af,hl
+; @end
+kbd_init:
+    ld a, 0xFF
+    ld (kbd_last_raw), a
+    xor a
+    ld (kbd_key_ready), a
+    ld (kbd_key_buf), a
+    ld (kbd_mods), a
+    ld (kbd_settle), a
+    ld (kbd_inject_len), a
+    ld (kbd_inject_rd), a
+    ld hl, REPEAT_DELAY
+    ld (kbd_rep_count), hl
+    ret
+
+
+; ==========================================================================
+; kbd_status — Check if a key is available (non-blocking)
+;   In:      nothing
+;   Out:     A = 0xFF if key ready, 0x00 if not
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc kbd_status
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+kbd_status:
+    ld a, (kbd_inject_len)     ; Inject buffer takes priority
+    or a
+    jr nz, .ready
+
+    ld a, (kbd_key_ready)
+    or a
+    jr nz, .ready
+
+    call _kbd_scan             ; Clobbers AF, BC, DE, HL
+    ld a, (kbd_key_ready)
+    or a
+    jr nz, .ready
+
+    xor a
+    ret
+.ready:
+    ld a, 0xFF
+    ret
+
+
+; ==========================================================================
+; kbd_getchar — Wait for keypress, return ASCII (blocking)
+;   In:      nothing
+;   Out:     A = ASCII character
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc kbd_getchar
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+kbd_getchar:
+    ; Drain inject buffer before touching real keyboard
+    ld a, (kbd_inject_len)
+    or a
+    jr z, .no_inject
+    ld hl, kbd_inject_buf
+    ld a, (kbd_inject_rd)
+    ld e, a
+    ld d, 0
+    add hl, de                 ; HL = &kbd_inject_buf[rd]
+    ld a, (hl)                 ; A = next injected byte
+    push af
+    ld hl, kbd_inject_rd
+    inc (hl)                   ; rd++
+    ld hl, kbd_inject_len
+    dec (hl)                   ; len--
+    pop af
+    ret
+.no_inject:
+    ld a, (kbd_key_ready)
+    or a
+    jr nz, .got_key
+.wait:
+    ei                         ; Allow ISR to tick (time, inject)
+    halt                       ; Wait for next interrupt (~50Hz)
+    di                         ; Back to system mode (interrupts off)
+    call _kbd_scan             ; Clobbers AF, BC, DE, HL
+    ld a, (kbd_inject_len)     ; Inject may arrive while waiting
+    or a
+    jr nz, kbd_getchar         ; Re-enter to drain inject buffer
+    ld a, (kbd_key_ready)
+    or a
+    jr z, .wait
+.got_key:
+    ld a, (kbd_key_buf)
+    push af
+    xor a
+    ld (kbd_key_ready), a      ; Consume key
+    pop af
+    ret
+
+
+; ==========================================================================
+; _kbd_scan — Scan matrix, detect key, handle debounce/repeat
+;   In:      nothing
+;   Out:     kbd_key_ready / kbd_key_buf updated
+;   Clobbers: AF, BC, DE, HL
+;
+;   Scans all 8 half-rows. Detects modifiers (Caps/Symbol Shift).
+;   If exactly one non-modifier key is pressed, maps to ASCII.
+;   Handles debounce (new key vs held key) and auto-repeat.
+; ==========================================================================
+; @proc _kbd_scan
+; @clobbers af,bc,de,hl
+; @end
+_kbd_scan:
+    ld c, PORT_KBD
+
+    ; --- Read modifier state ---
+    ; D = modifier flags: bit 0 = Caps Shift, bit 1 = Symbol Shift
+    ld d, 0
+
+    ld b, 0xFE                 ; Row 0
+    in a, (c)
+    bit 0, a                   ; Caps Shift (active low)
+    jr nz, .no_caps
+    set 0, d
+.no_caps:
+    ld b, 0x7F                 ; Row 7
+    in a, (c)
+    bit 1, a                   ; Symbol Shift (active low)
+    jr nz, .no_sym
+    set 1, d
+.no_sym:
+
+    ; --- Scan all rows for pressed keys ---
+    ; E = found raw key (0xFF = none)
+    ; H = total non-modifier key count
+    ; L = raw key base for current row (0, 5, 10, ...)
+    ; B = row address (cycles FE→FD→FB→F7→EF→DF→BF→7F)
+    ; C = PORT_KBD (constant)
+
+    ld e, 0xFF
+    ld h, 0
+    ld l, 0
+    ld b, 0xFE                 ; Start at row 0
+
+.row:
+    in a, (c)                  ; Read half-row
+    cpl                        ; Invert: 1 = pressed
+    and 0x1F                   ; Bits 0-4 only
+
+    ; Mask out modifier keys from the scan
+    ; Row 0 (0xFE): clear bit 0 (Caps Shift)
+    ; Row 7 (0x7F): clear bit 1 (Symbol Shift)
+    push af
+    ld a, b
+    cp 0xFE
+    jr nz, .not_r0
+    pop af
+    and 0x1E                   ; Mask Caps Shift
+    jr .masked
+.not_r0:
+    cp 0x7F
+    jr nz, .not_r7
+    pop af
+    and 0x1D                   ; Mask Symbol Shift
+    jr .masked
+.not_r7:
+    pop af
+.masked:
+
+    ; Any keys pressed in this row?
+    or a
+    jr z, .row_done
+
+    ; --- Check each bit in this row ---
+    push bc                    ; Save B=row addr, C=port
+    ld c, a                    ; C = pressed bits (1 = pressed)
+    ld b, 5                    ; B = bit counter (5 down to 1)
+
+.bit:
+    bit 0, c
+    jr z, .bit_next
+
+    ; Key found: raw = L + (5 - B)
+    ld a, l
+    add a, 5
+    sub b                      ; A = raw key code
+
+    ; Record it (or detect multi-press)
+    inc h                      ; Key count++
+    ld a, h
+    cp 2
+    jr nc, .multi              ; 2+ keys = abort
+    ; First key found:
+    ld a, l
+    add a, 5
+    sub b
+    ld e, a                    ; E = raw key
+
+.bit_next:
+    srl c                      ; Shift to next bit
+    djnz .bit
+
+    pop bc                     ; Restore B=row addr, C=port
+
+.row_done:
+    ld a, l
+    add a, 5
+    ld l, a                    ; Next row base
+
+    scf                        ; Ensure carry=1 for RL
+    rl b                       ; Next row address
+    jr c, .row                 ; Carry=0 only when B wraps to 0xFF (past row 7)
+
+    jr .scan_done
+
+.multi:
+    pop bc                     ; Clean stack from .bit loop
+    ld e, 0xFF                 ; Invalidate: multiple keys
+
+.scan_done:
+    ; E = raw key (0-39) or 0xFF (none / multiple)
+    ; D = modifiers (bit 0=caps, bit 1=sym)
+
+    ld a, e
+    cp 0xFF
+    jr z, .key_released
+
+    ; --- Key is pressed: debounce/repeat ---
+    ld a, (kbd_last_raw)
+    cp e
+    jr z, .same_key
+
+    ; --- New key pressed ---
+    ld a, e
+    ld (kbd_last_raw), a
+    ld a, d
+    ld (kbd_mods), a           ; Save modifiers
+    push hl
+    ld hl, REPEAT_DELAY
+    ld (kbd_rep_count), hl
+    pop hl
+    ; Debounce settle: record key but don't emit yet.
+    ; Next scan sees same_key with settle=1 → emit with confirmed modifiers.
+    ld a, 1
+    ld (kbd_settle), a
+    ret
+
+.same_key:
+    ; Check if we're in debounce settle — if so, finalize the keypress
+    ld a, (kbd_settle)
+    or a
+    jr z, .same_repeat
+    ; Settle complete: update modifiers with confirmed state and emit
+    xor a
+    ld (kbd_settle), a
+    ld a, d
+    ld (kbd_mods), a           ; Use settled modifier state
+    jr .emit
+
+.same_repeat:
+    ; Same key held: decrement 16-bit repeat counter
+    ; Do NOT update kbd_mods — keep from initial/settled press.
+    push hl
+    ld hl, (kbd_rep_count)
+    dec hl
+    ld (kbd_rep_count), hl
+    ld a, h
+    or l                       ; HL == 0?
+    pop hl
+    ret nz                     ; Still waiting
+    ; Repeat fires
+    push hl
+    ld hl, REPEAT_RATE
+    ld (kbd_rep_count), hl
+    pop hl
+    jr .emit
+
+.emit:
+    ; Map raw key E + modifiers D to ASCII
+    ld a, e                    ; A = raw key
+    ld d, a                    ; Save raw in D (will use HL for table)
+    ld a, (kbd_mods)
+    ld e, a                    ; E = modifiers
+    ld a, d                    ; A = raw key
+    call _kbd_to_ascii         ; Clobbers HL, DE
+                               ; Out: A = ASCII (0 = unmappable)
+    or a
+    ret z                      ; Unmappable — don't buffer
+    ld (kbd_key_buf), a
+    ld a, 1
+    ld (kbd_key_ready), a
+    ret
+
+.key_released:
+    ld a, 0xFF
+    ld (kbd_last_raw), a
+    xor a
+    ld (kbd_settle), a
+    ret
+
+
+; ==========================================================================
+; _kbd_to_ascii — Map raw key + modifiers to ASCII
+;   In:      A = raw key (0-39)
+;            E = modifiers (bit 0=caps, bit 1=sym)
+;   Out:     A = ASCII character (0 = unmappable)
+;   Clobbers: DE, HL
+; ==========================================================================
+; @proc _kbd_to_ascii
+; @param %key:u8   a
+; @param %mods:u8  e
+; @out   a
+; @clobbers de,hl
+; @end
+_kbd_to_ascii:
+    ld d, 0
+    ld l, a
+    ld h, d                    ; HL = raw key as 16-bit index
+
+    ld a, e                    ; A = modifiers
+    cp 3                       ; Caps + Sym = Ctrl
+    jr z, .ctrl
+    cp 2                       ; Symbol Shift
+    jr z, .sym
+    cp 1                       ; Caps Shift
+    jr z, .caps
+
+    ; --- Unshifted ---
+    ld de, _key_noshift
+    add hl, de
+    ld a, (hl)
+    ret
+
+.caps:
+    ld de, _key_caps
+    add hl, de
+    ld a, (hl)
+    ret
+
+.sym:
+    ld de, _key_sym
+    add hl, de
+    ld a, (hl)
+    ret
+
+.ctrl:
+    ; Ctrl = Caps+Sym: get unshifted char, if letter → control code
+    ld de, _key_noshift
+    add hl, de
+    ld a, (hl)
+    cp 'a'
+    jr c, .not_letter
+    cp 'z' + 1
+    jr nc, .not_letter
+    and 0x1F                   ; 'a'→0x01, 'b'→0x02, ... 'z'→0x1A
+    ret
+.not_letter:
+    ; Ctrl + non-letter: check for special combos
+    ; Ctrl+Space = Ctrl-C for safety
+    cp ' '
+    jr nz, .ctrl_none
+    ld a, 0x03
+    ret
+.ctrl_none:
+    xor a
+    ret
+
+
+; ==========================================================================
+; Key mapping tables (40 bytes each, indexed by raw key 0-39)
+; ==========================================================================
+
+; Raw key order within each row:
+;   Row 0: CS(0)  Z(1)  X(2)  C(3)  V(4)
+;   Row 1: A(5)   S(6)  D(7)  F(8)  G(9)
+;   Row 2: Q(10)  W(11) E(12) R(13) T(14)
+;   Row 3: 1(15)  2(16) 3(17) 4(18) 5(19)
+;   Row 4: 0(20)  9(21) 8(22) 7(23) 6(24)
+;   Row 5: P(25)  O(26) I(27) U(28) Y(29)
+;   Row 6: Ent(30) L(31) K(32) J(33) H(34)
+;   Row 7: Sp(35) SS(36) M(37) N(38) B(39)
+
+_key_noshift:
+    ;       CS    Z     X     C     V
+    db      0,    'z',  'x',  'c',  'v'
+    ;       A     S     D     F     G
+    db      'a',  's',  'd',  'f',  'g'
+    ;       Q     W     E     R     T
+    db      'q',  'w',  'e',  'r',  't'
+    ;       1     2     3     4     5
+    db      '1',  '2',  '3',  '4',  '5'
+    ;       0     9     8     7     6
+    db      '0',  '9',  '8',  '7',  '6'
+    ;       P     O     I     U     Y
+    db      'p',  'o',  'i',  'u',  'y'
+    ;       Ent   L     K     J     H
+    db      0x0D, 'l',  'k',  'j',  'h'
+    ;       Sp    SS    M     N     B
+    db      ' ',  0,    'm',  'n',  'b'
+
+_key_caps:
+    ;       CS    Z     X     C     V
+    db      0,    'Z',  'X',  'C',  'V'
+    ;       A     S     D     F     G
+    db      'A',  'S',  'D',  'F',  'G'
+    ;       Q     W     E     R     T
+    db      'Q',  'W',  'E',  'R',  'T'
+    ;       1     2     3     4     5
+    db      0,    0,    0,    0,    0x08    ; Caps+5 = left (BS)
+    ;       0     9     8     7     6
+    db      0x08, 0,    0,    0,    0       ; Caps+0 = BS (delete)
+    ;       P     O     I     U     Y
+    db      'P',  'O',  'I',  'U',  'Y'
+    ;       Ent   L     K     J     H
+    db      0x0D, 'L',  'K',  'J',  'H'
+    ;       Sp    SS    M     N     B
+    db      ' ',  0,    'M',  'N',  'B'    ; Caps+Space = space (Ctrl-C via Caps+Sym+C)
+
+_key_sym:
+    ;       CS    Z     X     C     V
+    db      0,    ':',  0,    '?',  '/'
+    ;       A     S     D     F     G
+    db      '~',  '|',  '\',  '{',  '}'
+    ;       Q     W     E     R     T
+    db      '`',  0,    0,    '<',  '>'
+    ;       1     2     3     4     5
+    db      '!',  '@',  '#',  '$',  '%'
+    ;       0     9     8     7     6
+    db      '_',  ')',  '(',  0x27, '&'    ; 0x27 = apostrophe
+    ;       P     O     I     U     Y
+    db      '"',  ';',  0,    ']',  '['
+    ;       Ent   L     K     J     H
+    db      0,    '=',  '+',  '-',  '^'
+    ;       Sp    SS    M     N     B
+    db      0,    0,    '.',  ',',  '*'

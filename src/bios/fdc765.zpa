@@ -1,0 +1,1092 @@
+; ==========================================================================
+; uPD765A Floppy Disk Controller Driver for ZX Spectrum +3
+; ==========================================================================
+;
+; CP/M 3 BIOS disk module for the +3's uPD765A FDC.
+;
+; +3 FDC ports:
+;   0x2FFD — Main status register (read only)
+;   0x3FFD — Data register (read/write)
+;   PORT_1FFD bit 3 — Motor control (1=on)
+;
+; +3 disk geometry (standard 3" CF2 SS):
+;   40 tracks, 1 side, 9 sectors/track, 512 bytes/sector
+;   Sector IDs: 1-9
+;   Total: 180K raw, ~170K usable with 2 reserved tracks
+;
+; CP/M uses 128-byte logical records. Physical sectors are 512 bytes.
+; The driver performs sector deblocking: maps 128-byte CP/M records
+; to 512-byte physical sectors (4 records per sector).
+;
+; XDPH layout (from CP/M 3 System Guide):
+;   -10: write routine address
+;   -8:  read routine address
+;   -6:  login routine address
+;   -4:  init routine address
+;   -2:  relative drive (byte), 0
+;    0:  DPH (standard Disk Parameter Header, 16 bytes)
+;         +0:  XLT   (sector translate table pointer, or 0)
+;         +2:  scratch (3 words, used by BDOS)
+;         +8:  DIRBUF (pointer to 128-byte directory buffer)
+;         +10: DPB   (pointer to Disk Parameter Block)
+;         +12: CSV   (pointer to checksum vector)
+;         +14: ALV   (pointer to allocation vector)
+;
+; DPB for +3 disk:
+;   SPT  = 36  (9 sectors × 4 records each = 36 logical sectors/track)
+;   BSH  = 3   (block shift: 1K blocks = 2^(BSH+7) = 1024)
+;   BLM  = 7   (block mask: 2^BSH - 1)
+;   EXM  = 0   (extent mask for <256 blocks)
+;   DSM  = 170 (max block number: (38 tracks × 9 × 512) / 1024 - 1)
+;   DRM  = 63  (max directory entry number: 64 entries - 1)
+;   AL0  = 0xC0 (directory allocation: blocks 0-1)
+;   AL1  = 0x00
+;   CKS  = 16  (checksum vector size: (DRM+1)/4)
+;   OFF  = 2   (reserved tracks)
+;   PSH  = 2   (physical sector shift: log2(512/128) = 2)
+;   PHM  = 3   (physical sector mask: 2^PSH - 1)
+;
+; ==========================================================================
+
+; FDC ports: PORT_FDC_ST, PORT_FDC_DT, PORT_1FFD defined in bios.asm
+; Bank constants: BANK0_1FFD, BANK1_1FFD, MOTOR_BIT defined in bios.asm
+; Disk state: disk_drive, disk_track, disk_sector, disk_dma in bios.asm
+; Inter-bank copy: copy_record_to_tpa, copy_record_from_tpa in common.asm
+; Motor flag: motor_flag in common.asm
+
+; --- FDC commands ---
+FDC_READ    equ 0x46           ; READ DATA (MFM, skip deleted)
+FDC_WRITE   equ 0x45           ; WRITE DATA (MFM)
+FDC_SEEK    equ 0x0F           ; SEEK
+FDC_RECAL   equ 0x07           ; RECALIBRATE
+FDC_SENSEI  equ 0x08           ; SENSE INTERRUPT STATUS
+FDC_READ_ID equ 0x4A           ; READ ID (MFM)
+
+; --- XDPB field offsets (byte index within the 27-byte per-drive XDPB) ---
+XDPB_BSH    equ 2              ; Block shift (block size = 128 << BSH)
+XDPB_DRM    equ 7              ; Directory entries - 1 (2 bytes)
+XDPB_AL0    equ 9              ; Directory allocation bitmap, blocks 0-7
+XDPB_AL1    equ 10             ; Directory allocation bitmap, blocks 8-15
+XDPB_CKS    equ 11             ; Check-vector size (2 bytes)
+XDPB_PSH    equ 15             ; log2(sector_size/128)
+XDPB_PHM    equ 16             ; (sector_size/128) - 1
+XDPB_SIDES  equ 17             ; 0=SS, 1=alternating DS, 2=successive DS
+XDPB_TRACKS equ 18             ; Tracks per side
+XDPB_SECTS  equ 19             ; Physical sectors per track
+XDPB_FIRST  equ 20             ; First sector ID on disc
+XDPB_GAP1   equ 23             ; Gap3 for read/write
+XDPB_FREEZE equ 26             ; 0 = auto-detect on login, 0xFF = keep current
+
+; --- Retry count ---
+MAX_RETRIES equ 10
+
+
+; ==========================================================================
+; drive_table, xdph_a, dpb_plus3 — moved to common memory (common.zpa)
+; so TPA programs (DISCKIT.COM etc.) can dereference them after DRVTBL/SELDSK.
+; Labels are still visible here because common.zpa is assembled in the same
+; sjasmplus pass (included from bios.asm inside a PHASE 0xFA00 block).
+; ==========================================================================
+
+
+; ==========================================================================
+; Buffers and state
+; ==========================================================================
+
+; dirbuf is in common memory (common.asm) — accessible from all bank modes
+
+; Checksum and allocation vectors — sized for the largest supported format.
+; Type 3 PCW DS/DD worst case: CKS=64, DSM=355 → ALV=(355/8)+1=45.
+; Smaller formats use only the first CKS / (DSM/8)+1 bytes; the rest is unused.
+csv_a:      ds 64
+alv_a:      ds 45
+
+csv_b:      ds 64
+alv_b:      ds 45
+
+; Sector deblocking buffer (one physical sector = 512 bytes)
+deblock_buf: ds 512
+
+; Deblocking state
+deblock_drv:  db 0xFF          ; Drive of buffered sector (FF=invalid)
+deblock_trk:  dw 0             ; Track of buffered sector
+deblock_psec: db 0             ; Physical sector of buffered sector (1-9)
+deblock_dirty: db 0            ; 1 = buffer has unwritten data
+
+; Current request (from BIOS disk variables)
+; These are referenced from the BIOS module:
+;   disk_drive, disk_track, disk_sector, disk_dma, dma_bank
+
+; FDC state
+; Per-drive cached head position (FF = unknown, needs recalibrate)
+fdc_current_track: db 0xFF, 0xFF
+fdc_motor_on:      db 0        ; Motor state
+
+
+; ==========================================================================
+; Standard XDPB table — 4 entries × 27 bytes, indexed by disc type (0-3).
+; fdc_login copies the matching entry into the drive's xdpb_a / xdpb_b
+; after detecting the format from the boot sector.  Freeze=FF on every
+; entry so a re-login keeps the detected format until a disk change.
+; ==========================================================================
+xdpb_std_table:
+; Type 0: +3/PCW SS — 40T × 9 × 512, 1K blocks, 1 reserved track, IDs 1-9
+    dw 36          ; SPT
+    db 3, 7, 0     ; BSH, BLM, EXM
+    dw 174, 63     ; DSM, DRM
+    db 0xC0, 0x00  ; AL0, AL1
+    dw 16, 1       ; CKS, OFF
+    db 2, 3        ; PSH, PHM
+    db 0, 40, 9, 1 ; Sidedness, Tracks, Sectors, FirstSectorID
+    dw 512         ; Sector size
+    db 42, 82, 0x40, 0xFF  ; Gap1, Gap2, Flags, Freeze
+; Type 1: CPC System — 40T × 9 × 512, 1K blocks, 2 reserved tracks, IDs 0x41-0x49
+    dw 36
+    db 3, 7, 0
+    dw 170, 63
+    db 0xC0, 0x00
+    dw 16, 2
+    db 2, 3
+    db 0, 40, 9, 0x41
+    dw 512
+    db 42, 82, 0x40, 0xFF
+; Type 2: CPC Data — 40T × 9 × 512, 1K blocks, 0 reserved tracks, IDs 0xC1-0xC9
+    dw 36
+    db 3, 7, 0
+    dw 179, 63
+    db 0xC0, 0x00
+    dw 16, 0
+    db 2, 3
+    db 0, 40, 9, 0xC1
+    dw 512
+    db 42, 82, 0x40, 0xFF
+; Type 3: PCW DS/DD 720K — 80T × 2 sides × 9 × 512, 2K blocks, alternating DS,
+; 1 reserved track, sector IDs 1-9. Canonical AMSDOS CF2DD defaults
+; (DirBlocks=2, DRM=127, AL0=C0h, CKS=32). fdc_login overlays
+; AL0/AL1/DRM/CKS from the disc's own boot-sector byte 7 (DirBlocks), so
+; these values are only a fallback for when the boot sector can't be read.
+    dw 36
+    db 4, 15, 0
+    dw 351, 127
+    db 0xC0, 0x00
+    dw 32, 1
+    db 2, 3
+    db 1, 80, 9, 1
+    dw 512
+    db 42, 82, 0x42, 0xFF
+
+
+; ==========================================================================
+; fdc_init — Initialize FDC and drive
+;   In:  nothing
+;   Out: nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc fdc_init
+; @clobbers af,bc,de,hl
+; @end
+fdc_init:
+    ld a, 0xFF
+    ld (fdc_current_track), a
+    ld (fdc_current_track + 1), a
+    ld (deblock_drv), a
+    xor a
+    ld (deblock_dirty), a
+    ld (fdc_motor_on), a
+    ; Recalibrate drive 0 (drive 1 recalibrates lazily on first access)
+    ld (disk_drive), a         ; A = 0 after xor
+    call motor_on
+    call fdc_recalibrate
+    call motor_off             ; Don't leave drive spinning after init
+    ret
+
+
+; ==========================================================================
+; fdc_login — Detect disc format and populate the per-drive XDPB.
+;
+; Algorithm:
+;   1. If drive's XDPB Freeze byte == 0xFF, skip detection and keep the
+;      currently-cached XDPB (covers re-login after a successful detect).
+;   2. Seek to track 0; issue READ ID to find the first sector on the disc.
+;      The sector ID distinguishes format groups:
+;        0x01        → type 0 (+3/PCW SS) or type 3 (PCW DS/DD)
+;        0x41 (65)   → type 1 (CPC System)
+;        0xC1 (193)  → type 2 (CPC Data)
+;   3. For sector-ID 0x01, read the boot sector (track 0, sector 1) and
+;      look at byte 0 — the AMSDOS disc-type byte (0-3).  That disambiguates
+;      +3/PCW SS (0) from PCW DS/DD (3).  Values outside 0-3 fall back to 0.
+;   4. Copy the matching 27-byte entry from xdpb_std_table into the drive
+;      XDPB (xdpb_a or xdpb_b).  Freeze ends up 0xFF, so the next call
+;      returns immediately.
+;
+;   In:  disk_drive set by the caller
+;   Out: per-drive XDPB populated
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc fdc_login
+; @clobbers af,bc,de,hl,ix
+; @end
+fdc_login:
+    call load_drive_xdpb            ; IX = this drive's XDPB
+    ld a, (ix + XDPB_FREEZE)
+    cp 0xFF
+    ret z                           ; Already detected — motor wasn't touched.
+
+    call motor_on
+    call .probe                     ; All internal paths ret into us...
+    jp motor_off                    ; ...then tail-off the motor on the way out.
+
+.probe:
+    xor a
+    ld (disk_head), a               ; Detection always probes side 0 of cyl 0
+    call fdc_seek                   ; Seek to track 0 (A=0)
+    ret nz                          ; Seek failed — leave XDPB at its default.
+
+    ; ---- Step 1: READ ID on track 0 to learn the first sector's number ----
+    ld a, FDC_READ_ID
+    call fdc_send_byte
+    ld a, (disk_drive)
+    and 0x03                        ; HD=0, US=drive
+    call fdc_send_byte
+
+    ; Result: 7 bytes — ST0 ST1 ST2 C H R N.  We want R.
+    call fdc_read_byte              ; ST0
+    call fdc_read_byte              ; ST1
+    call fdc_read_byte              ; ST2
+    call fdc_read_byte              ; C
+    call fdc_read_byte              ; H
+    call fdc_read_byte              ; R — sector ID
+    ld d, a                         ; D = first sector ID
+    call fdc_read_byte              ; N
+
+    ; ---- Step 2: map sector ID → format type ----
+    ld b, 0                         ; Tentative type 0
+    ld a, d
+    cp 0x41
+    jr z, .type1
+    cp 0xC1
+    jr z, .type2
+    jr .read_bootsect               ; 0x01 (or unknown) — try the boot sector
+
+.type1:
+    ld b, 1
+    jr .apply_static
+.type2:
+    ld b, 2
+    jr .apply_static
+
+    ; ---- Step 3: sector ID wasn't 0x41/0xC1; read sector 1 (boot sector) ----
+    ; to disambiguate type 0 vs 3.
+    ; Also leaves the full 10-byte AMSDOS disc spec at deblock_buf[0..9] so
+    ; we can overlay directory sizing from byte 7 (DirBlocks) below.
+.read_bootsect:
+    ld a, 1                         ; Always read sector 1 (the boot sector)
+    call fdc_read_sector            ; reads one physical sector into deblock_buf
+                                    ; NOTE: clobbers BC (B = ST1 from FDC result)
+    jr nz, .type0_fallback          ; Read failed — stick with type 0.
+
+    ld a, (deblock_buf)             ; Boot sector byte 0 = disc type (0-3)
+    cp 4
+    jr nc, .type0_fallback          ; Out of range — stick with type 0.
+    ld b, a                         ; B = disc type from boot sector
+    jr .apply_and_patch
+
+.type0_fallback:
+    ld b, 0                         ; Default to type 0 (+3/PCW SS)
+.apply_static:
+    ; B = disc type (0-3). Copy xdpb_std_table[B] to the drive's XDPB.
+    call .copy_template
+    ret
+
+.apply_and_patch:
+    call .copy_template
+    ; --- Overlay AL0/AL1/DRM/CKS from disc spec byte 7 (DirBlocks) ---
+    ; Only valid for PCW/Spectrum formats that carry a 10-byte AMSDOS disc
+    ; spec at boot-sector offset 0 — i.e. those we actually read above
+    ; (types 0 and 3). DirBlocks × (block_size = 128 << BSH) = dir bytes;
+    ; dir_bytes / 32 gives the number of directory entries.
+    ld a, (deblock_buf + 7)         ; DirBlocks (1..16)
+    or a
+    ret z                           ; DirBlocks=0 is nonsense — keep template
+    cp 17
+    ret nc                          ; >16 can't fit in AL0+AL1 — keep template
+    ld c, a                         ; C = DirBlocks (preserved across both loops)
+
+    ; Build AL0/AL1 = top DirBlocks bits of a 16-bit bitmap, AL0 = high byte.
+    ld hl, 0
+    ld b, c
+.login_bitmap:
+    scf
+    rr h
+    rr l
+    djnz .login_bitmap
+    ld (ix + XDPB_AL0), h
+    ld (ix + XDPB_AL1), l
+
+    ; DRM+1 = DirBlocks × 4 × (1 << BSH) = DirBlocks << (BSH + 2)
+    ld l, c
+    ld h, 0                         ; HL = DirBlocks
+    ld a, (ix + XDPB_BSH)
+    add a, 2
+    ld b, a
+.login_drm:
+    add hl, hl
+    djnz .login_drm                 ; HL = DRM + 1
+
+    ; CKS = (DRM+1) / 4
+    ld d, h
+    ld e, l
+    srl d
+    rr e
+    srl d
+    rr e
+    ld (ix + XDPB_CKS), e
+    ld (ix + XDPB_CKS + 1), d
+
+    dec hl                          ; HL = DRM
+    ld (ix + XDPB_DRM), l
+    ld (ix + XDPB_DRM + 1), h
+    ret
+
+.copy_template:
+    ld a, b
+    call xdpb_table_offset          ; HL = B × 27
+    ld de, xdpb_std_table
+    add hl, de                      ; HL = source entry
+    push ix
+    pop de                          ; DE = destination (drive's XDPB)
+    ld bc, 27
+    ldir
+    ret
+
+
+; ==========================================================================
+; xdpb_table_offset — Compute byte offset into xdpb_std_table for disc type A.
+;   In:  A = disc type (0-3)
+;   Out: HL = A × 27
+;   Clobbers: AF, BC, DE
+; ==========================================================================
+; @proc xdpb_table_offset
+; @out   hl
+; @clobbers af,bc,de
+; @end
+xdpb_table_offset:
+    ld b, a
+    ld hl, 0
+    ld de, 27
+    or a
+    ret z
+.loop:
+    add hl, de
+    djnz .loop
+    ret
+
+
+; ==========================================================================
+; load_drive_xdpb — Point IX at the XDPB for the currently selected drive.
+;   In:  disk_drive
+;   Out: IX = xdpb_a or xdpb_b
+;   Clobbers: AF
+; ==========================================================================
+; @proc load_drive_xdpb
+; @out   ix
+; @clobbers af
+; @end
+load_drive_xdpb:
+    ld ix, xdpb_a
+    ld a, (disk_drive)
+    or a
+    ret z
+    ld ix, xdpb_b
+    ret
+
+
+; ==========================================================================
+; fdc_read — Read a 128-byte CP/M record using deblocking
+;   In:  disk_track, disk_sector, disk_dma (set by BIOS)
+;   Out: A = 0 (OK) or 1 (error)
+;   Clobbers: AF, BC, DE, HL  (IX preserved internally)
+;
+;   CP/M logical sector = 0-35 (36 per track, set by BDOS)
+;   Physical sector = (logical / 4) + 1  (1-9)
+;   Record within sector = logical & 3   (0-3, ×128 byte offset)
+; ==========================================================================
+; @proc fdc_read
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+fdc_read:
+    push ix                    ; IX used internally (XDPB), but TPA programs need it preserved
+    call .body
+    pop ix
+    ret
+.body:
+    call ensure_sector         ; Ensure correct physical sector in buffer
+    ret nz                     ; Return error if read failed
+
+    ; Copy 128 bytes from deblock buffer to DMA address
+    call calc_record_offset    ; HL = source in deblock_buf
+    ld de, (disk_dma)
+
+    ; If DMA is in common memory (>= C000), direct copy; else inter-bank
+    ld a, d
+    cp 0xC0
+    jr nc, .direct
+    call copy_record_to_tpa   ; Common-memory routine (bank 4 → TPA)
+    xor a
+    ret
+.direct:
+    ld bc, 128
+    ldir
+    xor a                      ; A = 0 (success)
+    ret
+
+
+; ==========================================================================
+; fdc_write — Write a 128-byte CP/M record using deblocking
+;   In:  disk_track, disk_sector, disk_dma (set by BIOS)
+;        C = write type (0=normal, 1=directory, 2=first sector of new block)
+;   Out: A = 0 (OK) or 1 (error)
+;   Clobbers: AF, BC, DE, HL  (IX preserved internally)
+; ==========================================================================
+; @proc fdc_write
+; @param %wtype:u8 c
+; @out   a
+; @clobbers af,bc,de,hl
+; @end
+fdc_write:
+    push ix
+    call .body
+    pop ix
+    ret
+.body:
+    push bc                    ; Save write type
+    call ensure_sector         ; Ensure correct physical sector in buffer
+    pop bc
+    ret nz                     ; Error reading pre-existing sector
+
+    ; Copy 128 bytes from DMA address into deblock buffer
+    call calc_record_offset    ; HL = deblock_buf + (record * 128) (destination)
+    ex de, hl                  ; DE = destination in deblock_buf  ; lint: ignore
+    ld hl, (disk_dma)          ; HL = DMA (source)
+
+    ; If DMA is in common memory (>= C000), direct copy; else inter-bank
+    ld a, h
+    cp 0xC0
+    jr nc, .direct_write
+    call copy_record_from_tpa ; Common-memory routine (TPA → bank 4)
+    jr .write_done
+.direct_write:
+    ld bc, 128
+    ldir
+.write_done:
+
+    ; Mark buffer dirty
+    ld a, 1
+    ld (deblock_dirty), a
+
+    call flush_deblock
+    ret
+
+
+; ==========================================================================
+; ensure_sector — Make sure deblock buffer contains the right physical sector
+;   In:  disk_track, disk_sector
+;   Out: Z flag set if OK, NZ if error. A = 0 or 1.
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc ensure_sector
+; @out   a
+; @clobbers af,bc,de,hl,ix
+; @end
+ensure_sector:
+    ; Convert CP/M logical sector to physical sector ID via PSH and FIRST.
+    ; Shift logical sector right PSH times (4 records/sector for PSH=2),
+    ; then add the disc's FirstSectorID (0x01 on +3/PCW, 0x41/0xC1 on CPC).
+    call load_drive_xdpb       ; IX = this drive's XDPB
+    ld a, (disk_sector)
+    ld b, (ix + XDPB_PSH)
+.psh_shift:
+    dec b
+    jp m, .psh_done
+    srl a
+    jr .psh_shift
+.psh_done:
+    add a, (ix + XDPB_FIRST)   ; + first sector ID (typ 1)
+    ld b, a                    ; B = physical sector ID
+
+    ; Check if already buffered
+    ld a, (disk_drive)
+    ld c, a                    ; C = drive
+    ld a, (deblock_drv)
+    cp c
+    jr nz, .need_read
+    ld hl, (disk_track)
+    ld de, (deblock_trk)
+    or a
+    sbc hl, de
+    jr nz, .need_read
+    ld a, (deblock_psec)
+    cp b
+    jr z, .already_buffered    ; Same sector — no read needed
+
+.need_read:
+    ; Flush any dirty data first
+    push bc                    ; Save B = physical sector (flush clobbers BC)
+    call flush_deblock
+    pop bc
+
+    ; Record what we're buffering
+    ld a, (disk_drive)
+    ld (deblock_drv), a
+    ld hl, (disk_track)
+    ld (deblock_trk), hl
+    ld a, b                    ; B = physical sector (preserved across flush)
+    ld (deblock_psec), a
+
+    ; Derive physical cylinder+head from logical track and XDPB_SIDES.
+    ; SS      (0): head = 0, cylinder = track
+    ; Alt DS  (1): head = track & 1, cylinder = track >> 1
+    ; Succ DS (2): head = track / TRACKS, cylinder = track mod TRACKS
+    ;              (succ DS is not yet supported — falls through to SS)
+    call motor_on
+    ld a, (ix + XDPB_SIDES)
+    cp 1
+    jr z, .alt_ds
+    xor a                      ; SS: head = 0
+    ld (disk_head), a
+    ld a, (disk_track)
+    jr .do_seek
+.alt_ds:
+    ld a, (disk_track)
+    and 1
+    ld (disk_head), a          ; head = track & 1
+    ld a, (disk_track)
+    srl a                      ; cylinder = track / 2
+.do_seek:
+    call fdc_seek
+    ret nz                     ; Seek failed
+
+    ld a, (deblock_psec)
+    call fdc_read_sector       ; Read sector into deblock_buf
+    ret                        ; Z/NZ from read
+
+.already_buffered:
+    xor a                      ; Z flag, A=0 (success)
+    ret
+
+
+; ==========================================================================
+; flush_deblock — Write dirty deblock buffer to disk
+;   Out: A = 0 (OK) or 1 (error)
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc flush_deblock
+; @out   a
+; @clobbers af,bc,de,hl,ix
+; @end
+flush_deblock:
+    ld a, (deblock_dirty)
+    or a
+    ret z                      ; Not dirty, nothing to do
+
+    ; Re-derive cylinder+head from the drive that owns the buffered sector.
+    ; (deblock_drv may differ from disk_drive if the user switched drives.)
+    ld ix, xdpb_a
+    ld a, (deblock_drv)
+    or a
+    jr z, .flush_drive_ok
+    ld ix, xdpb_b
+.flush_drive_ok:
+    call motor_on
+    ld a, (ix + XDPB_SIDES)
+    cp 1
+    jr z, .flush_alt_ds
+    xor a
+    ld (disk_head), a
+    ld a, (deblock_trk)
+    jr .flush_seek
+.flush_alt_ds:
+    ld a, (deblock_trk)
+    and 1
+    ld (disk_head), a
+    ld a, (deblock_trk)
+    srl a
+.flush_seek:
+    call fdc_seek
+    ret nz
+
+    ld a, (deblock_psec)
+    call fdc_write_sector
+    ret nz
+
+    xor a
+    ld (deblock_dirty), a     ; Clear dirty flag
+    ret
+
+
+; ==========================================================================
+; calc_record_offset — Calculate offset of 128-byte record within deblock buf
+;   In:  disk_sector (CP/M logical sector 0-35)
+;   Out: HL = deblock_buf + (record * 128)
+;   Clobbers: AF, DE
+; ==========================================================================
+; @proc calc_record_offset
+; @out   hl
+; @clobbers af,de
+; @end
+calc_record_offset:
+    ld a, (disk_sector)
+    and 0x03                   ; Record within physical sector (0-3)
+    ld l, a
+    ld h, 0
+    ; Multiply by 128: shift left 7 times
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = record × 128
+    ld de, deblock_buf
+    add hl, de                 ; HL = &deblock_buf[record * 128]
+    ret
+
+
+; ==========================================================================
+; Low-level FDC operations
+; ==========================================================================
+
+; ------------------------------------------------------------------
+; fdc_seek — Seek to track
+;   In:  A = track number (0-39)
+;   Out: Z = success, NZ = error
+;   Clobbers: AF, BC, DE
+; ------------------------------------------------------------------
+; @proc fdc_seek
+; @param %track:u8 a
+; @out   zero
+; @clobbers af,bc,de,hl
+; @end
+fdc_seek:
+    ld (seek_target), a        ; Save target track
+    ; Point HL at fdc_current_track
+    call current_track_slot    ; HL = &fdc_current_track, A = cached track
+    cp 0xFF
+    jr nz, .have_pos
+    ; Head position unknown — recalibrate first
+    push hl
+    call fdc_recalibrate
+    pop hl
+    ret nz                     ; Recalibrate error
+    ld a, (hl)                 ; Now 0
+.have_pos:
+    ld b, a                    ; B = cached track
+    ld a, (seek_target)
+    cp b
+    ret z                      ; Already there
+
+    ; Issue SEEK command
+    ld a, FDC_SEEK
+    call fdc_send_byte
+    ld a, (disk_head)
+    rlca
+    rlca                       ; HD bit (bit 2 of drive-select byte)
+    and 0x04
+    ld b, a
+    ld a, (disk_drive)
+    and 0x03
+    or b                       ; HD | US
+    call fdc_send_byte
+    ld a, (seek_target)        ; NCN = target track
+    call fdc_send_byte
+
+    ; Wait for seek complete via SENSE INTERRUPT STATUS
+    call fdc_wait_seek
+    ret nz                     ; Seek error
+
+    call current_track_slot    ; HL = slot (disk_drive unchanged)
+    ld a, (seek_target)
+    ld (hl), a                 ; Update cached position
+    xor a                      ; Z flag (success)
+    ret
+
+seek_target: db 0
+
+; ------------------------------------------------------------------
+; current_track_slot — Point HL at fdc_current_track[disk_drive]
+;   Out: HL = address, A = current cached value
+;   Clobbers: AF, HL
+; ------------------------------------------------------------------
+; @proc current_track_slot
+; @out   hl
+; @out   a
+; @clobbers af,hl
+; @end
+current_track_slot:
+    ld hl, fdc_current_track
+    ld a, (disk_drive)
+    or a
+    jr z, .got
+    inc hl
+.got:
+    ld a, (hl)
+    ret
+
+
+; ------------------------------------------------------------------
+; fdc_recalibrate — Move head to track 0
+;   Out: Z = success, NZ = error
+;   Clobbers: AF, BC, DE
+; ------------------------------------------------------------------
+; @proc fdc_recalibrate
+; @out   zero
+; @clobbers af,bc,de,hl
+; @end
+fdc_recalibrate:
+    ld a, FDC_RECAL
+    call fdc_send_byte
+    ld a, (disk_drive)
+    and 0x03                   ; US = drive (0 or 1)
+    call fdc_send_byte
+
+    call fdc_wait_seek
+    ret nz                     ; Recalibrate error
+
+    call current_track_slot    ; HL = &fdc_current_track[drive]
+    ld (hl), 0                 ; Track 0 after recalibrate
+    xor a                      ; Z flag = success
+    ret
+
+
+; ------------------------------------------------------------------
+; fdc_wait_seek — Wait for seek/recalibrate to complete
+;   Polls SENSE INTERRUPT STATUS until Seek End bit is set.
+;   Out: Z = success, NZ = error
+;   Clobbers: AF, BC
+; ------------------------------------------------------------------
+; @proc fdc_wait_seek
+; @out   zero
+; @clobbers af,bc
+; @end
+fdc_wait_seek:
+.poll:
+    ld a, FDC_SENSEI
+    call fdc_send_byte
+    ; Read 2 result bytes: ST0, PCN
+    call fdc_read_byte         ; ST0
+    ld d, a
+    call fdc_read_byte         ; PCN (present cylinder number)
+
+    bit 5, d                   ; Seek End?
+    jr z, .poll                ; Not yet
+
+    ; Check for errors in ST0 bits 7:6
+    ld a, d
+    and 0xC0
+    ret z                      ; 00 = normal completion
+    ; Non-zero = error
+    or 1                       ; Ensure NZ
+    ret
+
+
+; ------------------------------------------------------------------
+; fdc_read_sector — Read one physical sector into deblock_buf
+;   In:  A = sector ID (1-9), head on correct track
+;   Out: Z = success, NZ = error
+;   Clobbers: AF, BC, DE, HL, IX
+; ------------------------------------------------------------------
+; @proc fdc_read_sector
+; @param %sector:u8 a
+; @out   zero
+; @clobbers af,bc,de,hl,ix
+; @end
+fdc_read_sector:
+    ld d, a                    ; D = sector ID
+    ld e, MAX_RETRIES          ; E = retry counter
+    call load_drive_xdpb       ; IX = this drive's XDPB
+
+.retry:
+    push de
+
+    ; Send READ DATA command
+    ld a, FDC_READ
+    call fdc_send_byte
+    ld a, (disk_head)
+    rlca
+    rlca
+    and 0x04
+    ld e, a
+    ld a, (disk_drive)
+    and 0x03
+    or e                       ; HD | US
+    call fdc_send_byte
+    call current_track_slot    ; A = cached track for current drive
+    call fdc_send_byte          ; C = cylinder
+    ld a, (disk_head)          ; H = head
+    call fdc_send_byte
+    ld a, d                    ; R = sector ID
+    call fdc_send_byte
+    ld a, (ix + XDPB_PSH)      ; N = sector size code (2 = 512 bytes)
+    call fdc_send_byte
+    ld a, d                    ; EOT = same sector (read just one)
+    call fdc_send_byte
+    ld a, (ix + XDPB_GAP1)     ; GPL
+    call fdc_send_byte
+    ld a, 0xFF                 ; DTL
+    call fdc_send_byte
+
+    ; Read execution phase — exactly 512 bytes into deblock_buf
+    ; Don't check EXM — just count bytes. 512 = 2 pages of 256.
+    ld hl, deblock_buf
+    ld bc, PORT_FDC_ST
+    ld d, 2                    ; 2 pages (D is free — sector ID was pushed)
+.page:
+    ld e, 0                    ; 256 bytes per page
+.exec:
+    in a, (c)
+    jp p, .exec                ; Wait for RQM
+    ld b, high PORT_FDC_DT
+    in a, (c)                  ; Read data byte
+    ld (hl), a
+    inc hl
+    ld b, high PORT_FDC_ST
+    dec e
+    jr nz, .exec
+    dec d
+    jr nz, .page
+
+    ; Read 7 result bytes — save ST0/ST1 FIRST since fdc_read_byte clobbers BC
+    call fdc_read_byte         ; ST0
+    push af                    ; Save ST0
+    call fdc_read_byte         ; ST1
+    push af                    ; Save ST1
+    call fdc_read_byte         ; ST2 (discard)
+    call fdc_read_byte         ; C (discard)
+    call fdc_read_byte         ; H (discard)
+    call fdc_read_byte         ; R (discard)
+    call fdc_read_byte         ; N (discard)
+
+    ; Check ST0/ST1 for real errors
+    pop bc                     ; B = ST1 (was second push)
+    pop af                     ; A = ST0 (was first push)
+    and 0xC0
+    cp 0x80                    ; ST0 bits 7:6 >= 10 = real failure
+    jr nc, .error
+    ld a, b                    ; ST1
+    and 0x37                   ; Check error bits (OR, ND, NW, DE, MA)
+    jr nz, .error
+
+    pop de                     ; Clean stack
+    xor a                      ; Z = success
+    ret
+
+.error:
+    pop de
+    dec e
+    jp nz, .retry              ; Try again
+    or 1                       ; NZ = permanent error
+    ret
+
+
+; ------------------------------------------------------------------
+; fdc_write_sector — Write one physical sector from deblock_buf
+;   In:  A = sector ID (1-9), head on correct track
+;   Out: Z = success, NZ = error
+;   Clobbers: AF, BC, DE, HL, IX
+; ------------------------------------------------------------------
+; @proc fdc_write_sector
+; @param %sector:u8 a
+; @out   zero
+; @clobbers af,bc,de,hl,ix
+; @end
+fdc_write_sector:
+    ld d, a
+    ld e, MAX_RETRIES
+    call load_drive_xdpb       ; IX = this drive's XDPB
+
+.retry:
+    push de
+
+    ; Send WRITE DATA command
+    ld a, FDC_WRITE
+    call fdc_send_byte
+    ld a, (disk_head)
+    rlca
+    rlca
+    and 0x04
+    ld e, a
+    ld a, (disk_drive)
+    and 0x03
+    or e                       ; HD | US
+    call fdc_send_byte
+    call current_track_slot    ; A = cached track for current drive
+    call fdc_send_byte
+    ld a, (disk_head)          ; H = head
+    call fdc_send_byte
+    ld a, d                    ; R = sector
+    call fdc_send_byte
+    ld a, (ix + XDPB_PSH)      ; N = sector size code
+    call fdc_send_byte
+    ld a, d                    ; EOT
+    call fdc_send_byte
+    ld a, (ix + XDPB_GAP1)     ; GPL
+    call fdc_send_byte
+    ld a, 0xFF                 ; DTL
+    call fdc_send_byte
+
+    ; Write execution phase — exactly 512 bytes from deblock_buf
+    ld hl, deblock_buf
+    ld bc, PORT_FDC_ST
+    ld d, 2                    ; 2 pages of 256
+.page:
+    ld e, 0
+.exec:
+    in a, (c)
+    jp p, .exec                ; Wait for RQM
+    ld b, high PORT_FDC_DT
+    ld a, (hl)
+    out (c), a                 ; Write byte to FDC
+    inc hl
+    ld b, high PORT_FDC_ST
+    dec e
+    jr nz, .exec
+    dec d
+    jr nz, .page
+
+    ; Read 7 result bytes — save ST0/ST1 before fdc_read_byte clobbers BC
+    call fdc_read_byte         ; ST0
+    push af
+    call fdc_read_byte         ; ST1
+    push af
+    call fdc_read_byte         ; ST2
+    call fdc_read_byte         ; C
+    call fdc_read_byte         ; H
+    call fdc_read_byte         ; R
+    call fdc_read_byte         ; N
+
+    pop bc                     ; B = ST1
+    pop af                     ; A = ST0
+    and 0xC0
+    cp 0x80
+    jr nc, .error
+    ld a, b
+    and 0x37
+    jr nz, .error
+
+    pop de
+    xor a
+    ret
+
+.error:
+    pop de
+    dec e
+    jp nz, .retry
+    or 1
+    ret
+
+
+; ==========================================================================
+; FDC byte-level I/O
+; ==========================================================================
+
+; ------------------------------------------------------------------
+; fdc_send_byte — Send command/parameter byte to FDC
+;   In:  A = byte to send
+;   Out: nothing
+;   Clobbers: AF, BC
+; ------------------------------------------------------------------
+; @proc fdc_send_byte
+; @param %byte:u8 a
+; @clobbers af,bc
+; @end
+fdc_send_byte:
+    push af
+    ld bc, PORT_FDC_ST
+.wait:
+    in a, (c)
+    jp p, .wait                ; Wait for RQM
+    pop af
+    ld bc, PORT_FDC_DT
+    out (c), a
+    ret
+
+
+; ------------------------------------------------------------------
+; fdc_read_byte — Read result byte from FDC
+;   In:  nothing
+;   Out: A = byte read
+;   Clobbers: BC
+; ------------------------------------------------------------------
+; @proc fdc_read_byte
+; @out   a
+; @clobbers bc
+; @end
+fdc_read_byte:
+    ld bc, PORT_FDC_ST
+.wait:
+    in a, (c)
+    jp p, .wait                ; Wait for RQM
+    ld bc, PORT_FDC_DT
+    in a, (c)
+    ret
+
+
+; ==========================================================================
+; Motor control
+; ==========================================================================
+
+; ------------------------------------------------------------------
+; motor_on — Turn disk motor on
+;   Clobbers: AF, BC
+; ------------------------------------------------------------------
+; @proc motor_on
+; @clobbers af,bc
+; @end
+MOTOR_OFF_DELAY equ 50         ; Frames of idle before ISR drops motor_flag
+                               ; (50 @ 50Hz = ~1s, close to +3DOS's tm_mtroff)
+
+motor_on:
+    ; Set motor flag in common memory and assert on port
+    ld a, MOTOR_BIT
+    ld (motor_flag), a         ; Common-memory variable
+    ld a, MOTOR_OFF_DELAY
+    ld (motor_countdown), a    ; Arm the motor-off timer in the ISR
+    ld a, BANK1_1FFD | MOTOR_BIT
+    call write_1ffd
+
+    ; Check if motor was already on (skip spin-up delay)
+    ld a, (fdc_motor_on)
+    or a
+    jr nz, .already_on
+
+    ld a, 1
+    ld (fdc_motor_on), a
+
+    ; Spin-up delay (~300ms for motor to reach speed)
+    ld b, 0                    ; 256 inner iterations
+    ld c, 170                  ; ~170 × 256 × 24 T-states ≈ 300ms
+.spin:
+    djnz .spin
+    dec c
+    jr nz, .spin
+
+.already_on:
+    ret
+
+
+; ------------------------------------------------------------------
+; motor_off — Turn disk motor off
+;   Clobbers: AF, BC
+; ------------------------------------------------------------------
+; @proc motor_off
+; @clobbers af,bc
+; @end
+motor_off:
+    xor a
+    ld (fdc_motor_on), a
+    ld (motor_flag), a         ; Clear motor flag in common memory
+    ld (motor_countdown), a    ; Disarm ISR motor-off timer
+    ; Restore 1FFD without motor bit
+    ld a, BANK1_1FFD           ; System bank, motor off
+    jp write_1ffd              ; Tail-call (updates shadow too)

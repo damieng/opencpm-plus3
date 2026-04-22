@@ -1,0 +1,995 @@
+; ==========================================================================
+; CP/M 3.1 Common Memory Stub (FA00-FFFF)
+; ==========================================================================
+;
+; Resident in bank 3, visible in both TPA (mode 0) and system (mode 2).
+; Contains the thin dispatcher that bridges user programs to the banked
+; BDOS/BIOS, plus inter-bank copy routines for DMA transfers.
+;
+; Included from bios.asm inside a PHASE 0xFA00 block.
+;
+; ==========================================================================
+
+; ==========================================================================
+; External proc declarations — bodies live in other files
+; ==========================================================================
+
+; @extern bdos_entry
+; @clobbers af,bc,de,hl
+; @end
+
+; @extern warm_boot
+; @clobbers af,bc,de,hl
+; @end
+
+; ==========================================================================
+; System Control Block (100 bytes at common_base + 0x00)
+; ==========================================================================
+;
+; Programs access SCB fields directly via common_base + offset (from F49).
+; This MUST be at offset 0 from the PHASE base.
+;
+scb_base:
+    ds 5                           ; 0x00-0x04: reserved
+scb_version:
+    db 0x31                        ; 0x05: CP/M version (3.1)
+    db 0x01                        ; 0x06: system type (1=CP/M Plus)
+    ds 19                          ; 0x07-0x19: reserved
+scb_conwidth:
+    db 50                          ; 0x1A: console width - 1
+    db 0                           ; 0x1B: reserved
+scb_conpage:
+    db 23                          ; 0x1C: console page height - 1
+    ds 29                          ; 0x1D-0x39: reserved
+scb_common:
+    dw 0                           ; 0x3A-0x3B: common memory base (patched at init)
+scb_dma:
+    dw 0x0080                      ; 0x3C-0x3D: current DMA address
+scb_curdsk:
+    db 0                           ; 0x3E: current disk
+    ds 5                           ; 0x3F-0x43: reserved
+scb_user:
+    db 0                           ; 0x44: current user number
+    ds 5                           ; 0x45-0x49: reserved
+scb_multi:
+    db 1                           ; 0x4A: multi-sector count
+scb_errmode:
+    db 0                           ; 0x4B: BDOS error mode
+    ds 12                          ; 0x4C-0x57: reserved
+scb_date:
+    dw 0                           ; 0x58-0x59: date (days since 1978-01-01, LE)
+scb_minute:
+    dw 0                           ; 0x5A-0x5B: minutes since midnight (binary, 0-1439, LE)
+scb_sec:
+    db 0                           ; 0x5C: second (binary, 0-59)
+    ds 5                           ; 0x5D-0x61: reserved
+scb_tpa:
+    dw 0                           ; 0x62-0x63: top of TPA (patched at init)
+
+    assert $ - scb_base == 100, "SCB must be exactly 100 bytes!"
+
+
+; ==========================================================================
+; BIOS Visible Jump Table (33 entries × 3 bytes = 99 bytes)
+; ==========================================================================
+;
+; Programs compute BIOS base from the warm boot vector at 0001-0002.
+; Page zero 0001 = &bios_visible[1] (WBOOT entry). So BIOS base =
+; that address - 3. Each entry here dispatches to the real BIOS in
+; bank 4 via bios_call_bank4.
+;
+; The 27 dispatched entries (fn 2..29 except 27) share a tight trampoline
+; block: each slot is a single `call bv_shim` (3 bytes). bv_shim recovers
+; the bank-4 target address from the call-site return address, with no
+; per-entry `ld hl,nn` needed. Fn 27 (BNKSEL) lives in common already, so
+; its slot in the block is a dead entry — cheaper than splitting the block.
+bios_visible:
+    jp warm_boot_stub              ;  0: BOOT (cold → warm from TPA)
+    jp warm_boot_stub              ;  1: WBOOT
+    jp bv_tramp + 3*(2 - 2)        ;  2: CONST
+    jp bv_tramp + 3*(3 - 2)        ;  3: CONIN
+    jp bv_tramp + 3*(4 - 2)        ;  4: CONOUT
+    jp bv_tramp + 3*(5 - 2)        ;  5: LIST
+    jp bv_tramp + 3*(6 - 2)        ;  6: AUXOUT
+    jp bv_tramp + 3*(7 - 2)        ;  7: AUXIN
+    jp bv_tramp + 3*(8 - 2)        ;  8: HOME
+    jp bv_tramp + 3*(9 - 2)        ;  9: SELDSK
+    jp bv_tramp + 3*(10 - 2)       ; 10: SETTRK
+    jp bv_tramp + 3*(11 - 2)       ; 11: SETSEC
+    jp bv_tramp + 3*(12 - 2)       ; 12: SETDMA
+    jp bv_tramp + 3*(13 - 2)       ; 13: READ
+    jp bv_tramp + 3*(14 - 2)       ; 14: WRITE
+    jp bv_tramp + 3*(15 - 2)       ; 15: LISTST
+    jp bv_tramp + 3*(16 - 2)       ; 16: SECTRN
+    jp bv_tramp + 3*(17 - 2)       ; 17: CONOST
+    jp bv_tramp + 3*(18 - 2)       ; 18: AUXIST
+    jp bv_tramp + 3*(19 - 2)       ; 19: AUXOST
+    jp bv_tramp + 3*(20 - 2)       ; 20: DEVTBL
+    jp bv_tramp + 3*(21 - 2)       ; 21: DEVINIT
+    jp bv_tramp + 3*(22 - 2)       ; 22: DRVTBL
+    jp bv_tramp + 3*(23 - 2)       ; 23: MULTIO
+    jp bv_tramp + 3*(24 - 2)       ; 24: FLUSH
+    jp bv_tramp + 3*(25 - 2)       ; 25: MOVE
+    jp bv_tramp + 3*(26 - 2)       ; 26: TIME
+    jp bank_sel                    ; 27: BNKSEL (already in common — direct)
+    jp bv_tramp + 3*(28 - 2)       ; 28: SETBNK
+    jp bv_tramp + 3*(29 - 2)       ; 29: XMOVE
+    jp userf_stub                  ; 30: USERF (XBIOS dispatch)
+    jp 0                           ; 31: reserved
+    jp 0                           ; 32: reserved
+
+; Trampoline block: one `call bv_shim` per BIOS fn 2..29. Slot fn=27 is
+; dead space (fn 27 is dispatched direct to bank_sel above), kept so that
+; the call-site address maps linearly to the bank-4 target.
+;
+; When bv_shim is entered, the return address on the stack is the address
+; of the instruction *after* the CALL, i.e. bv_tramp + 3*(fn-2) + 3. The
+; shim converts that back into the bank-4 target (3*fn) with a constant
+; DE added in:  bank4_target = ret_addr + 3 - bv_tramp  = 3*fn.
+bv_tramp:
+    dup 28
+        call bv_shim               ; 28 × 3 bytes = 84 bytes total
+    edup
+    assert $ - bv_tramp == 28 * 3, "bv_tramp must be exactly 84 bytes"
+
+bv_shim:
+    pop hl                         ; HL = return addr = bv_tramp + 3*(fn-2) + 3
+    ld de, 3 - bv_tramp            ; assembler wraps mod 65536
+    add hl, de                     ; HL = 3*fn — the bank-4 target
+    jp bios_call_bank4
+
+
+; ==========================================================================
+; bdos_stub — BDOS entry dispatcher (called from JP at 0005h)
+;
+; This MUST be the first executable code after the bios_visible wrappers.
+; Page zero 0x0005 has JP bdos_stub, and programs set SP to this address.
+; The TPA stack grows DOWN from here into TPA memory. ALL code and mutable
+; data must be placed AFTER bdos_stub — anything before it will be
+; overwritten by the program's stack.
+;
+; @proc bdos_stub
+; @param %func:u8   c          ; CP/M function number
+; @param %param:u16 de         ; CP/M parameter
+; @out   a                     ; result low byte
+; @out   hl                    ; result word
+; @clobbers bc
+; @end
+bdos_stub:
+    ; Assert: nothing mutable between SCB/visible table and bdos_stub.
+    ; The TPA stack grows DOWN from this address. If this assertion fires,
+    ; data was placed before bdos_stub that would be corrupted by the stack.
+    ; Guard: writable variables must be AFTER bdos_stub, never before.
+    ; The TPA stack grows down from bdos_stub and would corrupt anything below it.
+    assert saved_sp > bdos_stub, "saved_sp must be after bdos_stub (TPA stack grows down from it!)"
+
+    di
+    ld (saved_sp), sp
+    ld sp, bdos_stack
+
+    ; Save BDOS parameters (C=function, DE=param) before bank switch clobbers BC
+    push bc
+    push de
+
+    ; Switch to system banks (mode 3: 4,7,6,3)
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd
+
+    ; Restore BDOS parameters
+    pop de
+    pop bc
+
+    ; Call real BDOS (in bank 4)
+    call bdos_entry
+
+    ; Save ALL return values across bank switch (A, B, HL)
+    push hl
+    push af
+    push bc
+
+    ; Switch back to TPA (mode 0: 0,1,2,3)
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd
+
+    ; Restore return values
+    pop bc
+    pop af
+    pop hl
+
+    ; Restore user stack and return
+    ld sp, (saved_sp)
+    ei
+    ret
+
+
+; ==========================================================================
+; Variables (common memory — accessible from all bank modes)
+; Placed AFTER bdos_stub so the TPA stack (which grows down from
+; bdos_stub address) doesn't overwrite them.
+; ==========================================================================
+
+saved_sp:       dw 0               ; User stack pointer during BDOS call
+motor_flag:     db 0               ; 0x00 or MOTOR_BIT (0x08) — OR'd into every
+                                   ; 1FFD write.
+motor_countdown: db 0              ; Frames remaining until ISR drops the motor
+                                   ; (motor_on arms it to MOTOR_OFF_DELAY; ISR
+                                   ; ticks it down; on expiry the ISR clears
+                                   ; motor_flag and writes last_1ffd with the
+                                   ; motor bit cleared to physically stop it).
+last_1ffd:      db BANK1_1FFD      ; Shadow of 1FFD — maintained by write_1ffd
+                                   ; so the ISR can physically drop the motor
+                                   ; without having to know the current bank.
+                                   ; Initial value matches cold_boot: system
+                                   ; mode, motor off.
+isr_tick:       dw 0               ; 16-bit frame counter (~50Hz)
+isr_frac:       db 0               ; Frames within current second (0-49)
+isr_installed:  db 0               ; 1 = ISR trampoline at 0038h is set up
+
+
+; ==========================================================================
+; bios_call_bank4 — Generic BIOS dispatch: switch to bank 4, call, return
+;
+; Called from bios_visible wrappers (JP bios_call_bank4).
+; MUST be in the safe zone AFTER bdos_stub — the TPA stack grows down
+; from bdos_stub and would corrupt code/data placed before it.
+;
+; @proc bios_call_bank4
+; @param %target:u16 hl         ; bank 4 BIOS jump table address to call
+; @out   af                     ; BIOS return values (function-dependent)
+; @out   hl
+; @clobbers bc
+; @end
+bios_call_bank4:
+    ; lint-exempt: stack  ; uses jp (hl) via .jp_hl for the banked CALL (HL)
+    di
+    ld (_bc4_hl), %target          ; Save target address
+    ; Switch to a safe stack in common memory. The user's stack
+    ; may be in bank 1 (0x4000-0x7FFF) which becomes bank 7 after
+    ; the bank switch, making PUSH/POP read wrong data.
+    ld (_bc4_sp), sp
+    ld sp, _bc4_stack
+    ; Now PUSH/POP use common memory — safe across bank switches
+    push af
+    push bc
+    push de
+    ; Switch to system bank
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd
+    ; Restore caller's registers
+    pop de
+    pop bc
+    pop af
+    ; Switch to system stack for the actual BIOS call (the trampoline
+    ; stack is too small for screen/keyboard drivers)
+    ld sp, bdos_stack - 16         ; Use lower part of BDOS stack area
+    ld hl, (_bc4_hl)               ; HL = target address
+    ; CALL (HL) via push-return trick
+    call .jp_hl
+    ; BIOS function returned — save return values on safe stack
+    ld sp, _bc4_stack              ; Back to trampoline stack for bank switch
+    ld (_bc4_hl), hl
+    push af
+    push bc
+    push de
+    ; Switch back to TPA
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd
+    ; Restore return values
+    pop de
+    pop bc
+    pop af
+    ld hl, (_bc4_hl)
+    ; Restore user stack
+    ld sp, (_bc4_sp)
+    ei
+    ret
+
+.jp_hl:
+    jp (hl)                        ; Effectively CALL (HL)
+
+_bc4_hl: dw 0
+_bc4_sp: dw 0
+    ds 12                          ; 6-level trampoline stack (3 push pairs)
+_bc4_stack:
+
+
+; ==========================================================================
+; userf_stub — USERF (BIOS function 30) dispatcher for XBIOS calls
+;
+; Called as:   CALL USERF         (via bios_visible entry 30)
+;              DW   func_id       (inline 2-byte XBIOS function ID — the
+;                                  +3 XBIOS jump-table address)
+;
+; The +3 XBIOS jump table normally lives at bank 0:0x0080-0x00EC (see
+; docs/cpm-plus-xbios.md). We don't implement the full table in bank 4
+; yet; instead we dispatch a handful of IDs inline here and return an
+; error marker for anything else — so TPA programs that probe XBIOS
+; don't crash on the unknown IDs (as Mallard BASIC 1.44 did with 0x00BF
+; before we hardened this stub).
+;
+; MUST be placed AFTER bdos_stub — the TPA stack grows down from
+; bdos_stub and would overwrite code placed before it.
+;
+; @proc userf_stub
+; @out   af                     ; function-dependent
+; @out   bc
+; @out   hl
+; @end
+userf_stub:
+    ex (sp), hl                    ; HL = return addr → inline DW, caller HL on stack
+    ld a, (hl)                     ; A = func_id low byte (high byte assumed 0)
+    inc hl
+    inc hl                         ; HL = corrected return (past the DW)
+    ex (sp), hl                    ; return on stack, HL = caller HL
+    ; Dispatch every XBIOS ID to the bank-4 handler. Common memory is too
+    ; tight (FA00-FFFF) to inline the per-function return values, and the
+    ; bank switch adds only a few hundred T-states per call.
+    ld hl, xbios_handler
+    jp bios_call_bank4
+
+
+; ==========================================================================
+; write_1ffd — Write A to 1FFD and keep the last_1ffd shadow in sync.
+;   All bank-switch sites go through this so the ISR motor-off path can
+;   physically drop the motor bit without needing to know the current
+;   bank mode itself.
+; @proc write_1ffd
+; @param %val:u8  a
+; @clobbers bc
+; @end
+write_1ffd:
+    ld (last_1ffd), a
+    ld bc, PORT_1FFD
+    out (c), a
+    ret
+
+
+; ==========================================================================
+; warm_boot_stub — Called from JP at 0000h in TPA page zero
+;
+; @proc warm_boot_stub
+; @clobbers af,bc,de,hl
+; @end
+warm_boot_stub:
+    di
+    ld sp, bdos_stack
+
+    ; Switch to system banks
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd
+
+    ; Jump to warm boot in bank 4
+    jp warm_boot
+
+
+; ==========================================================================
+; isr_handler — Interrupt service routine (IM 1, called at 0038h)
+;   Must live in common memory (fires regardless of current bank mode).
+;   Updates isr_tick (raw frame counter) and BCD time in SCB every 50 frames.
+;
+; @proc isr_handler
+; @clobbers af,hl
+; @end
+isr_handler:
+    push af
+    push hl
+
+    ; --- Motor-off timeout (modeled on +3DOS l0068) ---
+    ; motor_on sets motor_countdown to MOTOR_OFF_DELAY. We decrement it
+    ; each frame; on expiry we clear motor_flag and write last_1ffd with
+    ; the motor bit cleared to physically stop the drive — we can't rely
+    ; on the next bank switch (the CCP's fn 10 blocks in system mode for
+    ; seconds at a time), and the last_1ffd shadow tells us which bank
+    ; value to write without having to know the current mode.
+    ld a, (motor_countdown)
+    or a
+    jr z, .mc_done
+    dec a
+    ld (motor_countdown), a
+    jr nz, .mc_done
+    ; Expired — clear motor_flag and physically drop the motor bit.
+    xor a
+    ld (motor_flag), a
+    ld a, (last_1ffd)
+    and ~MOTOR_BIT                 ; = 0xF7
+    ld (last_1ffd), a
+    push bc                        ; ISR doesn't normally save BC
+    ld bc, PORT_1FFD
+    out (c), a
+    pop bc
+.mc_done:
+
+    ; Increment raw frame counter
+    ld hl, (isr_tick)
+    inc hl
+    ld (isr_tick), hl
+
+    ; Count frames within current second
+    ld a, (isr_frac)
+    inc a
+    cp 50                          ; 50Hz = 1 second
+    jr c, .isr_no_tick
+    xor a                          ; Reset fractional counter
+    ld (isr_frac), a
+
+    ; --- Increment binary seconds ---
+    ld a, (scb_sec)
+    inc a
+    cp 60
+    jr c, .store_sec
+    xor a                          ; Seconds overflow -> 0
+.store_sec:
+    ld (scb_sec), a
+    jr nz, .isr_done              ; No minute rollover
+
+    ; --- Increment 16-bit minutes-since-midnight ---
+    ld hl, (scb_minute)
+    inc hl
+    ld a, h
+    cp 0x05                        ; 1440 = 0x05A0
+    jr nz, .store_min
+    ld a, l
+    cp 0xA0
+    jr nz, .store_min_low
+    ; 1440 reached → reset minutes, increment day counter
+    ld hl, 0
+    ld (scb_minute), hl
+    ld hl, (scb_date)
+    inc hl
+    ld (scb_date), hl
+    jr .isr_done
+.store_min_low:
+.store_min:
+    ld (scb_minute), hl
+    jr .isr_done
+
+.isr_no_tick:
+    ld (isr_frac), a              ; Store incremented frame count (1-49)
+.isr_done:
+    pop hl
+    pop af
+    ei
+    reti
+
+
+; ==========================================================================
+; start_tpa — Switch to TPA mode, set up page zero, jump to CCP
+;
+; @proc start_tpa
+; @clobbers af,bc,de,hl
+; @end
+start_tpa:
+    ; Switch to TPA (mode 0: 0,1,2,3)
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd
+
+    ; Set up page zero in bank 0
+    ; 0000: JP to BIOS visible WBOOT entry (programs use 0001 to find BIOS base)
+    ld a, JMP_OPCODE
+    ld (0x0000), a
+    ld hl, bios_visible + 3       ; Entry 1 = WBOOT in visible table
+    ld (0x0001), hl
+
+    ld a, JMP_OPCODE
+    ld (0x0005), a
+    ld hl, bdos_stub
+    ld (0x0006), hl
+
+    ; Install minimal ISR at bank 0's 0x0038 for TPA-mode interrupts.
+    ; Just EI+RETI (no tick counting). Programs like Mallard BASIC
+    ; overwrite this with their own RST 0x38 handler. The full ISR
+    ; with tick counting is at bank 4's 0x0038 for system-mode use.
+    ld a, 0xFB                     ; EI opcode
+    ld (0x0038), a
+    ld a, 0xED                     ; RETI prefix
+    ld (0x0039), a
+    ld a, 0x4D                     ; RETI suffix
+    ld (0x003A), a
+
+    ; Enable interrupts and start CCP
+    im 1
+    ld a, 1
+    ld (isr_installed), a
+    ei
+    jp CCP_ADDR
+
+
+; ==========================================================================
+; bank_sel — Select CPU bank (BIOS function 27)
+;
+; Must live in common memory because switching banks invalidates
+; the caller's address space.
+;
+; @proc bank_sel
+; @param %bank:u8  a            ; 0 = TPA (mode 0), non-zero = system (mode 3)
+; @clobbers af,bc
+; @end
+bank_sel:
+    or %bank
+    jr nz, .sys
+    ; Bank 0 (TPA): mode 0 — banks 0,1,2,3
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    jr .out
+.sys:
+    ; Bank 1 (system): mode 3 — banks 4,7,6,3
+    ld a, (motor_flag)
+    or BANK1_1FFD
+.out:
+    jp write_1ffd                  ; Tail-call: writes A to 1FFD, updates shadow, returns
+
+
+; ==========================================================================
+; FCB shadowing — copy user FCB to/from common-memory buffer
+; ==========================================================================
+;
+; File functions call setup_fcb on entry to copy the 36-byte FCB from
+; TPA to fcb_buf (common memory). BDOS works with fcb_buf. On exit,
+; writeback_fcb copies fcb_buf back to the user's TPA address.
+
+; ------------------------------------------------------------------
+; setup_fcb — Copy 36-byte FCB from TPA to fcb_buf
+;
+; @proc setup_fcb
+; @param %fcb:u16  de           ; user FCB address in TPA
+; @out   ix                     ; IX = fcb_buf (common memory copy)
+; @out   de                     ; DE preserved (= %fcb on return)
+; @clobbers af,bc,hl
+; @end
+setup_fcb:
+    ld (fcb_user_addr), %fcb       ; save user FCB address
+    ld hl, fcb_buf
+    push %fcb                      ; save user FCB address for restore
+    push hl                        ; save fcb_buf ptr for IX
+    ex de, hl                      ; DE = fcb_buf, HL = user FCB addr (TPA source)
+    ld bc, 36
+    call copy_from_user(hl, de, bc)
+    pop ix                         ; IX = fcb_buf
+    pop %fcb                       ; restore original DE
+    ret
+
+
+; ------------------------------------------------------------------
+; writeback_fcb — Copy fcb_buf back to TPA FCB address
+;
+; @proc writeback_fcb
+; @clobbers af,bc,de,hl
+; @end
+writeback_fcb:
+    ld hl, fcb_buf                 ; source: common memory
+    ld de, (fcb_user_addr)         ; dest: TPA
+    ld bc, 36
+    call copy_to_user(hl, de, bc)
+    ret
+
+
+; ==========================================================================
+; User memory access (TPA bank)
+; ==========================================================================
+;
+; The BDOS runs in system mode (bank 4 at 0000) but user buffers,
+; FCBs, and strings are in TPA (bank 0 at 0000). These helpers
+; switch to TPA temporarily to read/write user memory.
+;
+; They MUST live in common memory because system code vanishes
+; when we page in TPA.
+
+; ------------------------------------------------------------------
+; read_user_byte — Read one byte from TPA memory
+;
+; @proc read_user_byte
+; @param %addr:u16  de          ; address in TPA (banks 0/1/2)
+; @out   a                      ; byte read
+; @clobbers bc
+; @end
+read_user_byte:
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd                     ; switch to TPA
+    ld a, (%addr)                  ; read byte from TPA
+    push af
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd                     ; switch back to system
+    pop af
+    ret
+
+
+; ------------------------------------------------------------------
+; write_user_byte — Write one byte to TPA memory
+;
+; @proc write_user_byte
+; @param %byte:u8   a           ; byte to write
+; @param %addr:u16  de          ; address in TPA
+; @out   a                      ; preserved
+; @clobbers bc
+; @end
+write_user_byte:
+    push af                        ; save %byte
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd                     ; switch to TPA
+    pop af
+    ld (%addr), a                  ; write byte to TPA
+    push af
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd                     ; switch back to system
+    pop af
+    ret
+
+
+; ------------------------------------------------------------------
+; copy_from_user — Copy block from TPA to system memory
+;
+; Uses xfer_staging in 128-byte chunks.
+;
+; @proc copy_from_user
+; @param %src:u16   hl          ; source address in TPA
+; @param %dst:u16   de          ; destination in system memory
+; @param %count:u16 bc          ; byte count
+; @out   hl                     ; advanced past copied bytes
+; @out   de                     ; advanced past copied bytes
+; @clobbers af,bc
+; @end
+copy_from_user:
+    ld (_cfu_src), %src
+    ld (_cfu_dst), %dst
+    ld (_cfu_cnt), %count
+.loop:
+    ld bc, (_cfu_cnt)
+    ld a, b
+    or c
+    ret z
+    ; Clamp to 128
+    ld a, b
+    or a
+    jr nz, .c128
+    ld a, c
+    cp 33
+    jr c, .cok
+.c128:
+    ld bc, 32
+.cok:
+    ld (_cfu_chunk), bc
+    ; Update remaining
+    ld hl, (_cfu_cnt)
+    or a
+    sbc hl, bc
+    ld (_cfu_cnt), hl
+    ; Switch to TPA and copy to staging
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd
+    ld hl, (_cfu_src)
+    ld de, xfer_staging
+    ld bc, (_cfu_chunk)
+    ldir
+    ld (_cfu_src), hl
+    ; Switch back to system
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd
+    ; Copy staging to destination
+    ld hl, xfer_staging
+    ld de, (_cfu_dst)
+    ld bc, (_cfu_chunk)
+    ldir
+    ld (_cfu_dst), de
+    jr .loop
+
+_cfu_src:   dw 0
+_cfu_dst:   dw 0
+_cfu_cnt:   dw 0
+_cfu_chunk: dw 0
+
+
+; ------------------------------------------------------------------
+; copy_to_user — Copy block from system memory to TPA
+;
+; @proc copy_to_user
+; @param %src:u16   hl          ; source in system memory
+; @param %dst:u16   de          ; destination address in TPA
+; @param %count:u16 bc          ; byte count
+; @out   hl                     ; advanced past copied bytes
+; @out   de                     ; advanced past copied bytes
+; @clobbers af,bc
+; @end
+copy_to_user:
+    ld (_ctu_src), %src
+    ld (_ctu_dst), %dst
+    ld (_ctu_cnt), %count
+.loop:
+    ld bc, (_ctu_cnt)
+    ld a, b
+    or c
+    ret z
+    ld a, b
+    or a
+    jr nz, .c128
+    ld a, c
+    cp 33
+    jr c, .cok
+.c128:
+    ld bc, 32
+.cok:
+    ld (_ctu_chunk), bc
+    ld hl, (_ctu_cnt)
+    or a
+    sbc hl, bc
+    ld (_ctu_cnt), hl
+    ; Copy source to staging
+    ld hl, (_ctu_src)
+    ld de, xfer_staging
+    ld bc, (_ctu_chunk)
+    ldir
+    ld (_ctu_src), hl
+    ; Switch to TPA and copy staging to dest
+    ld a, (motor_flag)
+    or BANK0_1FFD
+    call write_1ffd
+    ld hl, xfer_staging
+    ld de, (_ctu_dst)
+    ld bc, (_ctu_chunk)
+    ldir
+    ld (_ctu_dst), de
+    ; Switch back to system
+    ld a, (motor_flag)
+    or BANK1_1FFD
+    call write_1ffd
+    jr .loop
+
+_ctu_src:   dw 0
+_ctu_dst:   dw 0
+_ctu_cnt:   dw 0
+_ctu_chunk: dw 0
+
+
+; ==========================================================================
+; Inter-bank copy routines
+; ==========================================================================
+
+; ------------------------------------------------------------------
+; copy_record_to_tpa — Copy 128-byte record from system to TPA
+;
+; Delegates to copy_to_user with count=128. Same chunked staging logic,
+; no separate variables needed.
+;
+; @proc copy_record_to_tpa
+; @param %src:u16  hl           ; source in bank 4 (system)
+; @param %dst:u16  de           ; destination in TPA (banks 0/1/2)
+; @clobbers af,bc,de,hl
+; @end
+copy_record_to_tpa:
+    ld bc, 128
+    jp copy_to_user
+
+
+; ------------------------------------------------------------------
+; copy_record_from_tpa — Copy 128-byte record from TPA to system
+;
+; Delegates to copy_from_user with count=128.
+;
+; @proc copy_record_from_tpa
+; @param %src:u16  hl           ; source in TPA (banks 0/1/2)
+; @param %dst:u16  de           ; destination in bank 4 (system)
+; @clobbers af,bc,de,hl
+; @end
+copy_record_from_tpa:
+    ld bc, 128
+    jp copy_from_user
+
+
+; ------------------------------------------------------------------
+; copy_block_to_tpa — Copy arbitrary-length block from system to TPA
+;
+; Used for CCP loading (warm/cold boot). Identical semantics to
+; copy_to_user (system→staging→TPA in 32-byte chunks); tail-call into it.
+;
+; @proc copy_block_to_tpa
+; @param %src:u16   hl          ; source in bank 4 (system)
+; @param %dst:u16   de          ; destination in TPA
+; @param %count:u16 bc          ; byte count
+; @clobbers af,bc,de,hl
+; @stack modifies
+; @end
+copy_block_to_tpa:
+    jp copy_to_user                ; tail call — same registers, same behaviour
+
+
+; ------------------------------------------------------------------
+; interbank_move — Inter-bank block move (byte-by-byte via common)
+;
+; Called from bios_move when xmove_active is set.
+; Must be in common memory because it switches banks mid-copy.
+;
+; @proc interbank_move
+; @param %dst:u16   hl          ; destination address
+; @param %src:u16   de          ; source address
+; @param %count:u16 bc          ; byte count
+; @out   hl                     ; advanced past written bytes
+; @out   de                     ; advanced past read bytes
+; @clobbers af
+; @end
+interbank_move:
+    ; Clear inter-bank flag (in system bank, still active on entry)
+    xor a
+    ld (xmove_active), a
+
+    ; Read bank numbers (in bank 4) before we start switching
+    ld a, (xmove_src)
+    ld (_ibm_src_bank), a
+    ld a, (xmove_dst)
+    ld (_ibm_dst_bank), a
+
+.loop:
+    push %count                    ; save BC across bank switches
+
+    ; Switch to source bank, read byte
+    ld a, (_ibm_src_bank)
+    call bank_sel(a)
+    ld a, (%src)                   ; read byte from source
+    inc %src
+    ld (_ibm_byte), a
+
+    ; Switch to dest bank, write byte
+    ld a, (_ibm_dst_bank)
+    call bank_sel(a)
+    ld a, (_ibm_byte)
+    ld (%dst), a                   ; write byte to destination
+    inc %dst
+
+    pop %count                     ; restore BC
+    dec %count
+    ld a, b                        ; test BC == 0
+    or c
+    jr nz, .loop
+
+    ; Restore system bank
+    ld a, 1
+    call bank_sel(a)
+    ret
+
+_ibm_src_bank: db 0
+_ibm_dst_bank: db 0
+_ibm_byte:     db 0
+
+
+; ==========================================================================
+; Disk parameter structures — in common memory so TPA programs (e.g.
+; DISCKIT.COM) can dereference them after calling DRVTBL/SELDSK.
+; csv_a, alv_a, dirbuf remain in bank 4; only BDOS follows those pointers.
+; ==========================================================================
+
+; Drive pointer table — 16 DPH pointers (BIOS fn 22 DRVTBL returns this)
+drive_table:
+    dw xdph_a                      ; A: — +3 floppy
+    dw xdph_b                      ; B: — +3 floppy (alias of A:, same physical drive)
+    dw 0, 0                        ; C:, D:
+    dw 0, 0, 0, 0                  ; E: through H:
+    dw 0, 0, 0, 0                  ; I: through L:
+    dw 0, 0, 0, 0                  ; M: through P:
+
+; XDPH prefix (10 bytes before xdph_a label)
+    dw fdc_write               ; -10: write routine
+    dw fdc_read                ; -8:  read routine
+    dw fdc_login               ; -6:  login routine
+    dw fdc_init                ; -4:  init routine
+    db 0, 0                    ; -2:  relative drive 0, padding
+
+; DPH (Disk Parameter Header) — address returned to BDOS by sel_disk
+xdph_a:
+    dw 0                       ; XLT: no sector translate
+    dw 0, 0, 0                 ; Scratch (used by BDOS)
+    dw dirbuf                  ; DIRBUF: 128-byte directory buffer
+    dw xdpb_a                  ; DPB pointer — per-drive XDPB
+    dw csv_a                   ; CSV: checksum vector (bank 4, BDOS only)
+    dw alv_a                   ; ALV: allocation vector (bank 4, BDOS only)
+
+; XDPH prefix for B: (10 bytes before xdph_b label)
+; B: is the second physical drive on the uPD765A (unit select US=1).
+    dw fdc_write               ; -10: write routine
+    dw fdc_read                ; -8:  read routine
+    dw fdc_login               ; -6:  login routine
+    dw fdc_init                ; -4:  init routine
+    db 1, 0                    ; -2:  relative drive 1, padding
+
+xdph_b:
+    dw 0                       ; XLT: no sector translate
+    dw 0, 0, 0                 ; Scratch (per-drive BDOS state)
+    dw dirbuf                  ; DIRBUF (shared — BDOS only uses while selected)
+    dw xdpb_b                  ; DPB pointer — per-drive XDPB
+    dw csv_b                   ; CSV: B:'s checksum vector
+    dw alv_b                   ; ALV: B:'s allocation vector
+
+; Per-drive XDPBs (27 bytes each). Bytes 0-16: standard CP/M 3 DPB;
+; bytes 17-26: Amstrad XBIOS extension. Initialised to the +3 SS/SD
+; default; intended to be overwritten by fdc_login after format
+; detection (once that's wired up again).  Layout per docs/cpm-plus-xbios.md.
+xdpb_a:
+    dw 36                      ; 0-1  SPT
+    db 3                       ; 2    BSH (1K blocks)
+    db 7                       ; 3    BLM
+    db 0                       ; 4    EXM
+    dw 174                     ; 5-6  DSM
+    dw 63                      ; 7-8  DRM
+    db 0xC0                    ; 9    AL0 (2 directory blocks)
+    db 0x00                    ; 10   AL1
+    dw 16                      ; 11-12 CKS
+    dw 1                       ; 13-14 OFF (1 reserved track)
+    db 2                       ; 15   PSH (log2(512/128))
+    db 3                       ; 16   PHM
+    ; --- Amstrad XDPB extension (bytes 17-26) ---
+    db 0                       ; 17   Sidedness: 0 = single-sided
+    db 40                      ; 18   Tracks per side
+    db 9                       ; 19   Physical sectors per track
+    db 1                       ; 20   First sector ID
+    dw 512                     ; 21-22 Physical sector size
+    db 42                      ; 23   Gap 3 R/W
+    db 82                      ; 24   Gap 3 format
+    db 0x40                    ; 25   Flags: MFM
+    db 0                       ; 26   Freeze: 0 = auto-detect on login
+xdpb_b:
+    dw 36
+    db 3
+    db 7
+    db 0
+    dw 174
+    dw 63
+    db 0xC0
+    db 0x00
+    dw 16
+    dw 1
+    db 2
+    db 3
+    db 0
+    db 40
+    db 9
+    db 1
+    dw 512
+    db 42
+    db 82
+    db 0x40
+    db 0
+
+
+; ==========================================================================
+; Buffers
+; ==========================================================================
+
+; Directory buffer — in common memory so FDC direct copy works.
+; Must be 128 bytes: the FDC driver deblocks to 128-byte records and
+; copy_to_user copies the full 128-byte sector to the user DMA area.
+dirbuf:     ds 128
+    assert $ - dirbuf == 128, "dirbuf must be exactly 128 bytes (fdc_read writes one full deblocked record)"
+
+; FCB shadow buffer — file functions copy the user's FCB here before
+; processing, then copy it back on return. Avoids per-access bank switching.
+fcb_buf:        ds 36
+    assert $ - fcb_buf == 36, "fcb_buf must be exactly 36 bytes (CP/M FCB format)"
+fcb_user_addr:  dw 0               ; TPA address of the user's FCB
+
+; Inter-bank transfer staging buffer (32 bytes).
+; Reduced from 128 to save common memory. The copy_record_to/from_tpa
+; and copy_block_to_tpa routines copy in 32-byte chunks instead of 128.
+xfer_staging: ds 32
+    assert $ - xfer_staging == 32, "xfer_staging must be exactly 32 bytes (copy_to/from_user chunk size)"
+
+; BDOS stack (grows downward from bdos_stack label)
+bdos_stack_base:
+    ds 64
+bdos_stack:
+    assert bdos_stack - bdos_stack_base == 64, "BDOS stack must be 64 bytes"
+
+; ==========================================================================
+; End of common memory stub
+; ==========================================================================
+common_end:
+
+    assert common_end <= 0xFFFF, "Common stub overflows bank 3!"

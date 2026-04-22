@@ -1,0 +1,952 @@
+; DATE.COM — CP/M 3.1 Date and Time Utility
+; Y2K-compliant: displays four-digit year (CCYY format)
+;
+; Usage:
+;   DATE           — display current date and time
+;   DATE S         — set date and time interactively
+;   DATE C         — continuous display (press any key to exit)
+;
+; Date system: 16-bit days since 1978-01-01 in SCB.
+;   Day 1 = Sunday, January 1, 1978.
+;   Time stored as BCD hour, BCD min, BCD sec.
+;
+; Build:
+;   sjasmplus --raw=build/date.com src/util/date.asm
+
+    ORG 0100h
+
+BDOS_ENTRY  EQU 0005h
+FCB1        EQU 005Ch       ; FCB1+1 = first char of command arg
+
+; BDOS function numbers
+F_CWRITE    EQU 2
+F_CWSTR     EQU 9
+F_CRSTR     EQU 10
+F_CSTAT     EQU 11
+F_SETDMA    EQU 26
+F_GETSCB    EQU 49
+F_SETTOD    EQU 104
+F_GETTOD    EQU 105
+
+SCB_DATEFMT EQU 0Ch         ; SCB date format: 0=US, 1=UK, 2=YMD
+
+; ============================================================
+; Entry point
+; ============================================================
+; @proc start
+; @clobbers af,bc,de,hl
+; @end
+start:
+    ld a, (FCB1 + 1)
+    cp 'C'
+    jr z, do_continuous
+    cp 'S'
+    jr z, do_set
+    jr do_display
+
+; ============================================================
+; do_display — show date/time once
+; ============================================================
+; @proc do_display
+; @clobbers af,bc,de,hl
+; @end
+do_display:
+    call display_tod
+    call crlf
+    jp 0000h
+
+; ============================================================
+; do_continuous — display until keypress (carriage-return loops)
+; ============================================================
+; @proc do_continuous
+; @clobbers af,bc,de,hl
+; @end
+do_continuous:
+.loop:
+    call display_tod
+    ld c, F_CSTAT
+    call BDOS_ENTRY
+    or a
+    jr z, .loop
+    ld c, 1                 ; consume key
+    call BDOS_ENTRY
+    call crlf
+    jp 0000h
+
+; ============================================================
+; do_set — interactive date/time entry
+; ============================================================
+; @proc do_set
+; @clobbers af,bc,de,hl
+; @end
+do_set:
+    call crlf
+
+    ; Prompt for date
+    call get_datefmt        ; A = 0/1/2
+    cp 2
+    jr z, .ymd
+    cp 1
+    jr z, .uk
+    ld de, str_pus          ; US: MM/DD/YY
+    jr .pdate
+.uk:
+    ld de, str_puk          ; UK: DD/MM/YY
+    jr .pdate
+.ymd:
+    ld de, str_pymd         ; YMD: YY-MM-DD
+.pdate:
+    ld c, F_CWSTR
+    call BDOS_ENTRY
+    call read_line          ; read into inbuf, returns length in A
+    ld (saved_len), a
+    call crlf
+    ld a, (saved_len)
+    or a
+    jr z, .ask_time
+    ld hl, inbuf + 2
+    call parse_date
+    jr c, .err
+
+.ask_time:
+    ld de, str_ptime
+    ld c, F_CWSTR
+    call BDOS_ENTRY
+    call read_line
+    ld (saved_len), a
+    call crlf
+    ld a, (saved_len)
+    or a
+    jr z, .commit
+    ld hl, inbuf + 2
+    call parse_time
+    jr c, .err
+
+.commit:
+    ld de, tod_set
+    ld c, F_SETTOD
+    call BDOS_ENTRY
+    jr do_display
+
+.err:
+    ld de, str_err
+    ld c, F_CWSTR
+    call BDOS_ENTRY
+    call crlf
+    jp 0000h
+
+; ============================================================
+; display_tod — fetch time-of-day, decode and print
+;   Clobbers: all
+; ============================================================
+; @proc display_tod
+; @clobbers af,bc,de,hl
+; @end
+display_tod:
+    ; Get date/time → DMA buffer tod_buf
+    ld de, tod_buf
+    ld c, F_SETDMA
+    call BDOS_ENTRY
+    ld c, F_GETTOD
+    call BDOS_ENTRY
+
+    ; Decode day count into year/month/day/weekday
+    ld hl, (tod_buf)        ; HL = days (LE word)
+    call compute_date       ; fills year_v,month_v,day_v,wday_v
+
+    ; CR to overwrite line
+    ld e, 0Dh
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+
+    ; Day-of-week (3 chars from day_names, 4 bytes/entry)
+    ld a, (wday_v)
+    add a, a
+    add a, a                ; * 4
+    ld l, a
+    ld h, 0
+    ld de, day_names
+    add hl, de
+    ld b, 3
+.dn:
+    ld a, (hl)
+    ld e, a
+    ld c, F_CWRITE
+    push hl
+    push bc
+    call BDOS_ENTRY
+    pop bc
+    pop hl
+    inc hl
+    djnz .dn
+
+    ld e, ' '
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+
+    ; Date according to format
+    call get_datefmt
+    cp 2
+    jr z, .fymd
+    cp 1
+    jr z, .fuk
+    ; US: MM/DD/CCYY
+    ld a, (month_v)
+    call print_d2
+    call print_sep_slash
+    ld a, (day_v)
+    call print_d2
+    call print_sep_slash
+    call print_year4
+    jr .do_time
+.fuk:
+    ; UK: DD/MM/CCYY
+    ld a, (day_v)
+    call print_d2
+    call print_sep_slash
+    ld a, (month_v)
+    call print_d2
+    call print_sep_slash
+    call print_year4
+    jr .do_time
+.fymd:
+    ; YMD: CCYY-MM-DD
+    call print_year4
+    call print_sep_dash
+    ld a, (month_v)
+    call print_d2
+    call print_sep_dash
+    ld a, (day_v)
+    call print_d2
+
+.do_time:
+    ld e, ' '
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    ld a, (tod_buf + 2)
+    call print_bcd2
+    ld e, ':'
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    ld a, (tod_buf + 3)
+    call print_bcd2
+    ld e, ':'
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    ld a, (tod_buf + 4)
+    call print_bcd2
+    ret
+
+; ============================================================
+; print_year4 — print 4-digit year from year_v (78=1978, 126=2026)
+; Y2K: century = 19 + year/100
+; ============================================================
+; @proc print_year4
+; @clobbers af,bc,de
+; @end
+print_year4:
+    ld a, (year_v)
+    ld b, a
+    ld c, 100
+    call div_bc             ; A = quotient (0/1/2), B = year mod 100
+    push bc                 ; save B=year_mod100 (BDOS calls in print_d2 clobber B)
+    add a, 19               ; century (19 or 20...)
+    call print_d2
+    pop bc                  ; restore B = year mod 100
+    ld a, b
+    call print_d2
+    ret
+
+; ============================================================
+; compute_date — convert 16-bit days in HL to
+;   year_v (78=1978), month_v (1-12), day_v (1-31), wday_v (0=Sun)
+;
+; @proc compute_date
+; @param %days:u16  hl             ; day count (day 1 = Jan 1 1978 = Sunday)
+; @out   year_v                    ; year since 1900 (78=1978)
+; @out   month_v                   ; month 1-12
+; @out   day_v                     ; day 1-31
+; @out   wday_v                    ; weekday 0=Sun
+; @clobbers af,bc,de,hl
+; @end
+compute_date:
+    inc hl                  ; scb_date is 0-based; compute uses 1-based
+    ; weekday = (HL - 1) mod 7  (day 1 = index 0 = Sunday)
+    push hl
+    dec %days
+    call mod7_hl            ; A = HL mod 7
+    ld (wday_v), a
+    pop hl                  ; restore HL = days
+
+    ; Subtract year lengths from HL until HL <= year_length
+    ld a, 78
+    ld (year_v), a
+
+.yr_loop:
+    ld a, (year_v)
+    and 3
+    jr nz, .yr_365
+    ld bc, 366
+    jr .yr_cmp
+.yr_365:
+    ld bc, 365
+.yr_cmp:
+    ; if HL <= BC: done
+    call hl_le_bc
+    jr c, .yr_done          ; HL <= BC → stop
+    ; HL -= BC; year++
+    xor a
+    sbc hl, bc
+    ld a, (year_v)
+    inc a
+    ld (year_v), a
+    jr .yr_loop
+.yr_done:
+    ; HL = day-of-year (1..366)
+    ld (doy_v), hl
+
+    ; leap_bias: year%4==0 AND doy>59 → 1 else 0
+    xor a
+    ld (leap_v), a
+    ld a, (year_v)
+    and 3
+    jr nz, .no_lb
+    ld hl, (doy_v)
+    ld de, 59
+    call hl_gt_de           ; HL > 59?
+    jr nc, .no_lb
+    ld a, 1
+    ld (leap_v), a
+.no_lb:
+
+    ; Find month: scan from 12 down to 1
+    ; Find largest m such that month_days[m-1] + leap_bias < doy
+    ld b, 12
+.mon_loop:
+    ; effective leap bias: 0 if month index < 2 (Jan=0, Feb=1)
+    ld a, b
+    dec a                   ; 0-based month index
+    cp 2
+    jr c, .lb0
+    ld a, (leap_v)
+    jr .lb_ok
+.lb0:
+    xor a
+.lb_ok:
+    push af                 ; save leap bias (in A)
+
+    ; HL = month_days[b-1]
+    ld a, b
+    dec a                   ; 0-based
+    call mdays              ; HL = cumul days before this month
+
+    ; HL += leap_bias
+    pop de                  ; E = leap bias
+    ld a, l
+    add a, e
+    ld l, a
+    ld a, h
+    adc a, 0
+    ld h, a
+
+    ; if HL < doy_v: found this month
+    ld de, (doy_v)
+    call hl_lt_de           ; HL < DE?
+    jr c, .mon_ok
+    dec b
+    jr nz, .mon_loop
+    ld b, 1
+.mon_ok:
+    ld a, b
+    ld (month_v), a
+
+    ; day = doy - (month_days[month-1] + leap_bias)
+    ld a, b
+    dec a
+    call mdays              ; HL = month_days[month-1]
+    ld a, b
+    dec a
+    cp 2
+    jr c, .lb0b
+    ld a, (leap_v)
+    jr .lb_ok2
+.lb0b:
+    xor a
+.lb_ok2:
+    ld e, a
+    ld a, l
+    add a, e
+    ld l, a
+    ld a, h
+    adc a, 0
+    ld h, a                 ; HL = month_days[m-1] + leap_bias
+    ld de, (doy_v)
+    ; day = DE - HL
+    ex de, hl               ; HL = doy_v, DE = m_days+lb
+    xor a
+    sbc hl, de              ; HL = doy - (m_days+lb)
+    ld a, l
+    ld (day_v), a
+    ret
+
+; ============================================================
+; mdays — get cumulative days before month A (0-based)
+;
+; @proc mdays
+; @param %month:u8  a              ; 0-based month index
+; @out   hl                        ; month_days_tbl[A] (word)
+; @clobbers af,de,hl
+; @end
+mdays:
+    and 0Fh
+    ld hl, month_days_tbl
+    ld e, a
+    ld d, 0
+    add hl, de
+    add hl, de              ; HL += A*2 (each entry is word)
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ret
+
+; ============================================================
+; mod7_hl — HL mod 7 → A
+;
+; @proc mod7_hl
+; @param %n:u16  hl
+; @out   a
+; @clobbers af,bc,hl
+; @end
+mod7_hl:
+    ld bc, 7
+.lp:
+    ; if HL < 7: done
+    ld a, h
+    or a
+    jr nz, .sub             ; H > 0, definitely >= 7
+    ld a, l
+    cp 7
+    jr c, .done             ; L < 7
+.sub:
+    xor a
+    sbc hl, bc
+    jr .lp
+.done:
+    ld a, l
+    ret
+
+; ============================================================
+; div_bc — B / C → A (quotient), B = remainder
+;
+; @proc div_bc
+; @param %dividend:u8  b
+; @param %divisor:u8   c
+; @out   a                         ; quotient
+; @out   b                         ; remainder
+; @clobbers f,d
+; @end
+div_bc:
+    ld d, 0
+.lp:
+    ld a, %dividend
+    cp %divisor
+    jr c, .done
+    sub %divisor
+    ld %dividend, a
+    inc d
+    jr .lp
+.done:
+    ld a, d
+    ret
+
+; ============================================================
+; hl_le_bc — test HL <= BC  (carry set if true)
+;
+; @proc hl_le_bc
+; @param %lhs:u16  hl
+; @param %rhs:u16  bc
+; @out   carry                     ; set if HL <= BC
+; @clobbers af
+; @end
+hl_le_bc:
+    ; HL <= BC  ⟺  NOT (HL > BC)
+    ld a, h
+    cp b
+    jr c, .yes              ; H < B → HL < BC → HL <= BC ✓
+    jr nz, .no              ; H > B → HL > BC
+    ld a, l
+    cp c
+    jr z, .yes              ; H==B, L==C → HL==BC ✓
+    jr nc, .no              ; L > C → HL > BC
+.yes:
+    scf
+    ret
+.no:
+    or a
+    ret
+
+; ============================================================
+; hl_gt_de — test HL > DE  (carry set if true)
+;
+; @proc hl_gt_de
+; @param %lhs:u16  hl
+; @param %rhs:u16  de
+; @out   carry                     ; set if HL > DE
+; @clobbers af
+; @end
+hl_gt_de:
+    ld a, h
+    cp d
+    jr c, .no
+    jr nz, .yes
+    ld a, l
+    cp e
+    jr z, .no               ; HL == DE → not >
+    jr nc, .yes
+.no:
+    or a
+    ret
+.yes:
+    scf
+    ret
+
+; ============================================================
+; hl_lt_de — test HL < DE  (carry set if true)
+;
+; @proc hl_lt_de
+; @param %lhs:u16  hl
+; @param %rhs:u16  de
+; @out   carry                     ; set if HL < DE
+; @clobbers af
+; @end
+hl_lt_de:
+    ld a, h
+    cp d
+    jr c, .yes
+    jr nz, .no
+    ld a, l
+    cp e
+    jr c, .yes
+.no:
+    or a
+    ret
+.yes:
+    scf
+    ret
+
+; ============================================================
+; print_d2 — print A as 2-digit decimal with leading zero
+;
+; @proc print_d2
+; @param %val:u8  a
+; @clobbers af,bc,de
+; @end
+print_d2:
+    ld b, %val
+    ld c, 10
+    call div_bc             ; A = tens, B = units
+    push bc
+    add a, '0'
+    ld e, a
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    pop bc
+    ld a, b                 ; units (remainder from div_bc)
+    add a, '0'
+    ld e, a
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    ret
+
+; ============================================================
+; print_bcd2 — print BCD byte A as two decimal digits
+;
+; @proc print_bcd2
+; @param %bcd:u8  a
+; @clobbers af,bc,de
+; @end
+print_bcd2:
+    push af                 ; save full BCD byte
+    and 0F0h                ; isolate high nibble
+    rrca                    ; rotate right (circular, no carry) x4
+    rrca                    ; → high nibble now in bits 3-0
+    rrca
+    rrca
+    add a, '0'
+    ld e, a
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    pop af                  ; restore original BCD byte
+    and 0Fh                 ; low nibble
+    add a, '0'
+    ld e, a
+    ld c, F_CWRITE
+    call BDOS_ENTRY
+    ret
+
+; ============================================================
+; Separator helpers
+; ============================================================
+
+; @proc print_sep_slash
+; @clobbers af,bc,de,hl
+; @end
+print_sep_slash:
+    ld e, '/'
+    ld c, F_CWRITE
+    jp BDOS_ENTRY
+
+; @proc print_sep_dash
+; @clobbers af,bc,de,hl
+; @end
+print_sep_dash:
+    ld e, '-'
+    ld c, F_CWRITE
+    jp BDOS_ENTRY
+
+; @proc crlf
+; @clobbers af,bc,de,hl
+; @end
+crlf:
+    ld de, str_crlf
+    ld c, F_CWSTR
+    jp BDOS_ENTRY
+
+; ============================================================
+; get_datefmt — SCB[0Ch] → A (0=US, 1=UK, 2=YMD)
+;
+; @proc get_datefmt
+; @out a                           ; 0=US, 1=UK, 2=YMD
+; @clobbers af,bc,de,hl
+; @end
+get_datefmt:
+    ld de, scb_fmt_pb
+    ld c, F_GETSCB
+    call BDOS_ENTRY
+    ld a, l
+    and 3
+    ret
+
+; ============================================================
+; read_line — read console line into inbuf (max 20 chars)
+;
+; @proc read_line
+; @out a                           ; length of input
+; @clobbers af,bc,de
+; @end
+read_line:
+    ld a, 20
+    ld (inbuf), a
+    xor a
+    ld (inbuf + 1), a
+    ld de, inbuf
+    ld c, F_CRSTR
+    call BDOS_ENTRY
+    ld a, (inbuf + 1)
+    ret
+
+; ============================================================
+; parse_date — parse date string at HL per current format
+;   Fills tod_set[0..1] with day count
+;
+; @proc parse_date
+; @param %buf:u16  hl              ; pointer to input string
+; @out   carry                     ; set on error
+; @clobbers af,bc,de,hl
+; @end
+parse_date:
+    call p2d                ; first 2-digit field → A
+    jr c, .err
+    ld b, a
+    call skip_sep
+    jr c, .err
+    call p2d                ; second field → A
+    jr c, .err
+    ld c, a
+    call skip_sep
+    jr c, .err
+    push bc
+    call p2d                ; third field (year or day) → A
+    pop bc
+    jr c, .err
+    ld d, a                 ; B, C, D = three fields
+
+    ; Assign month/day/year by format
+    push bc
+    push de
+    call get_datefmt
+    pop de
+    pop bc
+    or a
+    jr nz, .not_us
+    ; US: B=MM, C=DD, D=YY
+    ld a, b
+    ld (cd_month), a
+    ld a, c
+    ld (cd_day), a
+    ld a, d
+    jr .got_y
+.not_us:
+    cp 1
+    jr nz, .do_ymd
+    ; UK: B=DD, C=MM, D=YY
+    ld a, c
+    ld (cd_month), a
+    ld a, b
+    ld (cd_day), a
+    ld a, d
+    jr .got_y
+.do_ymd:
+    ; YMD: B=YY, C=MM, D=DD
+    ld a, c
+    ld (cd_month), a
+    ld a, d
+    ld (cd_day), a
+    ld a, b
+.got_y:
+    ; Pivot 2-digit year: < 78 → add 100 (so "26" → 126 = 2026)
+    cp 78
+    jr nc, .no_pivot
+    add a, 100
+.no_pivot:
+    ld (cd_year), a
+    call days_from_ymd      ; → tod_set[0..1]
+    xor a                   ; clear carry = success
+    ret
+.err:
+    scf
+    ret
+
+; ============================================================
+; parse_time — parse HH:MM[:SS] at HL
+;   Fills tod_set[2..3] (hour BCD, min BCD)
+;
+; @proc parse_time
+; @param %buf:u16  hl
+; @out   carry                     ; set on error
+; @clobbers af,bc,de,hl
+; @end
+parse_time:
+    call p2d
+    jr c, .err
+    call bcd2               ; A = BCD
+    ld (tod_set + 2), a
+    call skip_sep
+    jr c, .err
+    call p2d
+    jr c, .err
+    call bcd2
+    ld (tod_set + 3), a
+    ; Optional seconds — ignore (F104 only takes hour/min)
+    or a
+    ret
+.err:
+    scf
+    ret
+
+; ============================================================
+; p2d — parse 2 ASCII decimal digits at (HL) → A; HL += 2
+;
+; @proc p2d
+; @param %ptr:u16  hl              ; pointer into input string
+; @out   a                         ; parsed value 0-99
+; @out   hl                        ; advanced by 2
+; @out   carry                     ; set on error
+; @clobbers f,bc
+; @end
+p2d:
+    ld a, (%ptr)
+    sub '0'
+    jr c, .err
+    cp 10
+    jr nc, .err
+    ld b, a
+    inc %ptr
+    ld a, (%ptr)
+    sub '0'
+    jr c, .err
+    cp 10
+    jr nc, .err
+    ; result = b*10 + a
+    ld c, a
+    ld a, b
+    add a, a
+    add a, a
+    add a, a                ; b*8
+    add a, b
+    add a, b                ; b*10
+    add a, c
+    inc %ptr
+    or a
+    ret
+.err:
+    scf
+    ret
+
+; @proc bcd2
+; @param %val:u8  a                ; decimal value
+; @out   a                         ; BCD encoded (e.g. 23 → 0x23)
+; @clobbers af,bc
+; @end
+bcd2:
+    ld b, %val
+    ld c, 10
+    call div_bc             ; A = tens, B = units
+    add a, a
+    add a, a
+    add a, a
+    add a, a                ; tens << 4
+    or b                    ; | units
+    ret
+
+; @proc skip_sep
+; @param %ptr:u16  hl              ; pointer into input string
+; @out   hl                        ; advanced by 1
+; @out   carry                     ; set on error (not / or -)
+; @clobbers af,hl
+; @end
+skip_sep:
+    ld a, (%ptr)
+    cp '/'
+    jr z, .ok
+    cp '-'
+    jr z, .ok
+    scf
+    ret
+.ok:
+    inc %ptr
+    or a
+    ret
+
+; ============================================================
+; days_from_ymd — compute day count from cd_year/month/day
+;   → stores 16-bit result in tod_set[0..1]
+;
+; @proc days_from_ymd
+; @clobbers af,bc,de,hl
+; @end
+days_from_ymd:
+    ld a, (cd_year)
+    ld b, a                 ; B = year (78..255)
+
+    ; 365 * (year - 78)
+    ld a, b
+    sub 78
+    ld l, a
+    ld h, 0                 ; HL = year-78
+    ; Multiply HL by 365
+    push bc
+    ld b, h
+    ld c, l                 ; BC = year-78
+    ld hl, 0
+    ld de, 365
+.mul:
+    ld a, b
+    or c
+    jr z, .mul_done
+    add hl, de
+    dec bc
+    jr .mul
+.mul_done:
+    pop bc                  ; B = year
+
+    ; DE = 365*(year-78); HL will accumulate total
+    ex de, hl
+
+    ; Add month_days[month-1]
+    ld a, (cd_month)
+    dec a                   ; 0-based
+    push bc
+    push de
+    call mdays              ; HL = month_days[m-1]
+    pop de
+    pop bc
+    add hl, de              ; HL += 365*(y-78)
+
+    ; Add day
+    ld a, (cd_day)
+    ld e, a
+    ld d, 0
+    add hl, de
+
+    ; Subtract ld(78, 0) = 19
+    ld de, 19
+    xor a
+    sbc hl, de
+
+    ; Add ld(year, month-1)
+    ; ld(y,m) = y/4  (logical right shift, carry-independent)
+    ld a, b
+    srl a
+    srl a                   ; A = year >> 2 = year/4
+    ; y=78: 19 ✓   y=80: 20 ✓   y=126: 31 ✓
+    ld e, a
+    ld d, 0                 ; DE = year/4
+    ; Subtract 1 if year%4==0 AND month_days[m-1] < 59
+    ld a, b
+    and 3
+    jr nz, .no_ldadj
+    ld a, (cd_month)
+    dec a                   ; 0-based
+    push de
+    push hl
+    call mdays              ; HL = month_days[m-1]
+    ld a, l
+    pop hl
+    pop de
+    cp 59
+    jr nc, .no_ldadj        ; >= 59: no adjustment
+    dec de                  ; month_days[m-1] < 59: subtract 1
+.no_ldadj:
+    add hl, de
+    ld (tod_set), hl
+    ret
+
+; ============================================================
+; Data
+; ============================================================
+
+; Day names: 4 bytes each (3 chars + space), indices 0=Sun..6=Sat
+day_names:
+    db "Sun ", "Mon ", "Tue ", "Wed ", "Thu ", "Fri ", "Sat "
+
+; Cumulative days before each month (0-based index, non-leap year)
+month_days_tbl:
+    dw 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+
+; SCB F49 parameter block: [offset, value_to_set] (0xFF = read)
+scb_fmt_pb:
+    db SCB_DATEFMT, 0FFh
+
+; Strings
+str_crlf:   db 0Dh, 0Ah, '$'
+str_pus:    db "Enter date (MM/DD/YY): $"
+str_puk:    db "Enter date (DD/MM/YY): $"
+str_pymd:   db "Enter date (YY-MM-DD): $"
+str_ptime:  db "Enter time (HH:MM:SS): $"
+str_err:    db "Error$"
+
+; Work variables (date decomposition results)
+year_v:     db 0
+month_v:    db 0
+day_v:      db 0
+wday_v:     db 0
+doy_v:      dw 0
+leap_v:     db 0
+
+; Set-date intermediates
+saved_len:   db 0
+cd_year:    db 78
+cd_month:   db 1
+cd_day:     db 1
+
+; F105 DMA buffer: [days_lo, days_hi, hour, min, sec]
+tod_buf:    db 0, 0, 0, 0, 0
+
+; F104 set buffer: [days_lo, days_hi, hour, min]
+tod_set:    db 0, 0, 0, 0
+
+; Console input buffer: [max, actual, data...]
+inbuf:      db 20, 0
+            ds 22

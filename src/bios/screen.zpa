@@ -1,0 +1,2204 @@
+; ==========================================================================
+; CP/M 3.1 Screen Driver for ZX Spectrum +3
+; ==========================================================================
+;
+; 51-column × 24-row text display using 5×8 pixel font.
+;   51 × 5 = 255 pixels (fits 256-pixel width)
+;   24 × 8 = 192 pixels (exact Spectrum height)
+;
+; Characters are NOT byte-aligned. A 5-pixel-wide character at column C
+; starts at pixel C*5. The character may straddle two screen bytes.
+;
+; Spectrum screen address:  010 TT SSS RRR CCCCC
+;   TT    = screen third (0-2)
+;   SSS   = pixel row within char cell (0-7)
+;   RRR   = char row within third (0-7)
+;   CCCCC = byte column (0-31)
+; Advancing scan lines within a char cell: INC H (increments SSS).
+;
+; ==========================================================================
+;
+; REGISTER CLOBBERING RULES
+; =========================
+; Every routine documents:  In:, Out:, Clobbers:
+; "Clobbers" means the register is DESTROYED on return.
+; Callers MUST save any listed clobbered register they need.
+;
+; _page_in and _page_out clobber AF and BC.
+; _cursor_buf_addr clobbers AF, DE, HL.
+; _render_char clobbers AF, BC, DE, HL, IX.
+;
+; ==========================================================================
+
+; --- Constants ---
+SCR_COLS_MAX equ 51            ; Maximum/buffer column count (always 51)
+SCR_ROWS    equ 24
+SCR_BASE    equ 0x4000
+SCR_ATTR    equ 0x5800
+
+; --- Escape-sequence state constants ---
+ESC_NORMAL     equ 0   ; no pending ESC
+ESC_SAW_ESC    equ 1   ; received 0x1B, next byte is command
+ESC_WAIT_Y_ROW equ 2   ; ESC Y: waiting for row param (+32)
+ESC_WAIT_Y_COL equ 3   ; ESC Y: got row, waiting for col param (+32)
+ESC_WAIT_X_TR  equ 4   ; ESC X: waiting for top-row param (+32)
+ESC_WAIT_X_LC  equ 5   ; ESC X: got tr, waiting for left-col (+32)
+ESC_WAIT_X_H   equ 6   ; ESC X: got lc, waiting for height (+32)
+ESC_WAIT_X_W   equ 7   ; ESC X: got h, waiting for width (+32) — last param
+ESC_WAIT_1P    equ 8   ; one-param stub: ESC b/c/2/3/4/5 — consume and ignore
+
+; PORT_1FFD, PORT_ULA, BANK1_1FFD, motor_flag defined in parent/common
+
+PAGING_SCREEN equ 0x05         ; Mode 2 (4,5,6,3) — bank 5 at 0x4000
+
+DEFAULT_ATTR equ 0x0F          ; Blue paper, white ink
+BORDER_COL   equ 1             ; Blue
+
+
+; ==========================================================================
+; Variables (in system bank — only accessed during BDOS/BIOS calls)
+; ==========================================================================
+
+cursor_col: db 0               ; 0-50
+cursor_row: db 0               ; 0-23
+_rnd_shift: db 0               ; Shift amount for current render
+_rnd_bcol:  db 0               ; Byte column for current render
+_rnd_row:   db 0               ; Row for current render (saved here
+                               ; because we run out of registers)
+
+; --- Escape-sequence parser state ---
+esc_state:  db 0               ; Current parser state (ESC_*)
+esc_cmd:    db 0               ; Command byte for parameterised ESC
+esc_p1:     db 0               ; First param byte (e.g. Y row, X top)
+esc_p2:     db 0               ; Second param byte
+esc_p3:     db 0               ; Third param byte
+saved_row:  db 0               ; Saved cursor row  (ESC j / ESC k)
+saved_col:  db 0               ; Saved cursor col  (ESC j / ESC k)
+
+; --- XBIOS colour state ---
+scr_ink:      db 7             ; Ink colour 0-7 (Spectrum GRB)
+scr_paper:    db 1             ; Paper colour 0-7
+scr_ink_br:   db 0             ; Ink bright: 0 or 1
+scr_paper_br: db 0             ; Paper bright: 0 or 1
+scr_flash:    db 0             ; Flash: 0x00 or 0x80
+scr_attr:     db DEFAULT_ATTR  ; Computed attribute byte (F B PPP III)
+scr_border_v: db BORDER_COL    ; Current border colour 0-7
+scr_cols:     db 51            ; Runtime column count (32 or 51)
+font_ptr:     dw 0x8000       ; Active font in bank 6 (0x8000=51col, 0x8800=32col)
+
+char_buffer:
+    block SCR_COLS_MAX * SCR_ROWS, 0x20
+
+; Row → char_buffer offset table. Populated by scr_init from scr_cols.
+; 24 words: row_buf_tbl[r] = r * scr_cols. Replaces iterative multiply.
+row_buf_tbl:
+    block SCR_ROWS * 2, 0
+
+
+; ==========================================================================
+; scr_init — Clear screen, set attributes, reset cursor
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc scr_init
+; @clobbers af,bc,de,hl
+; @end
+scr_init:
+    ; Build row_buf_tbl[r] = r * scr_cols for r in 0..SCR_ROWS-1
+    ld hl, row_buf_tbl
+    ld a, (scr_cols)
+    ld c, a
+    ld b, 0                    ; BC = scr_cols increment
+    ld de, 0                   ; DE = running sum
+    ld a, SCR_ROWS
+.rbt_loop:
+    ld (hl), e
+    inc hl
+    ld (hl), d
+    inc hl
+    ex de, hl
+    add hl, bc                 ; sum += scr_cols
+    ex de, hl
+    dec a
+    jr nz, .rbt_loop
+
+    ld hl, char_buffer
+    ld de, char_buffer + 1
+    ld (hl), 0x20
+    ld bc, SCR_COLS_MAX * SCR_ROWS - 1
+    ldir
+
+    xor a
+    ld (cursor_col), a
+    ld (cursor_row), a
+
+    ld a, BORDER_COL
+    out (PORT_ULA), a
+
+    call _page_in              ; Clobbers AF, BC
+
+    ld hl, SCR_BASE
+    ld de, SCR_BASE + 1
+    ld (hl), 0
+    ld bc, 6143
+    ldir
+
+    ld a, (scr_attr)
+    ld hl, SCR_ATTR
+    ld de, SCR_ATTR + 1
+    ld (hl), a
+    ld bc, 767
+    ldir
+
+    call _page_out             ; Clobbers AF, BC
+    ret
+
+
+; ==========================================================================
+; scr_putchar — Output character at cursor, advance cursor
+;   In:      A = character
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc scr_putchar
+; @param %ch:u8 a
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+scr_putchar:
+    ; lint-exempt: stack  ; ESC-dispatch table uses jp (hl) to reach handlers
+    ; ----- Escape-sequence state machine -----
+    push af                    ; save char while we check state
+    ld a, (esc_state)
+    or a
+    jr z, .esc_normal          ; state 0 → normal char dispatch
+    cp ESC_SAW_ESC
+    jp z, .esc_dispatch        ; state 1 → decode command char
+    cp ESC_WAIT_Y_ROW
+    jp z, .esc_y_row
+    cp ESC_WAIT_Y_COL
+    jp z, .esc_y_col
+    cp ESC_WAIT_X_TR
+    jp z, .esc_x_tr
+    cp ESC_WAIT_X_LC
+    jp z, .esc_x_lc
+    cp ESC_WAIT_X_H
+    jp z, .esc_x_h
+    cp ESC_WAIT_X_W
+    jp z, .esc_x_w
+    ; ESC_WAIT_1P — consume byte, return to NORMAL
+    xor a
+    ld (esc_state), a
+    pop af
+    ret
+
+.esc_normal:
+    pop af                     ; restore char for normal dispatch
+    cp 0x1B
+    jr z, .enter_esc
+    cp 0x0D
+    jp z, _do_cr
+    cp 0x0A
+    jp z, _do_lf
+    cp 0x08
+    jp z, _do_bs
+    cp 0x07
+    ret z                      ; BEL — ignore
+    cp 0x20
+    ret c                      ; Other control chars — ignore
+
+    ; --- Printable character ---
+    push af                    ; Save char (in A)
+
+    ; Write to buffer
+    call _cursor_buf_addr      ; Clobbers AF, DE, HL → HL = buf addr
+    pop af                     ; Restore char
+    ld (hl), a                 ; Store in buffer
+
+    ; Render to screen
+    push af                    ; Save char again
+    call _page_in              ; Clobbers AF, BC
+    pop af                     ; A = char
+
+    ; Set up args for _render_char: A=char, C=col, D=row (from memory)
+    ld b, a                    ; B = char (safe — not clobbered below)
+    ld a, (cursor_col)
+    ld c, a                    ; C = col
+    ld a, (cursor_row)
+    ld d, a                    ; D = row
+    ; B=char, C=col, D=row
+    call _render_char          ; Clobbers AF, BC, DE, HL, IX
+    call _page_out             ; Clobbers AF, BC
+
+    ; Advance cursor
+    ld a, (cursor_col)
+    inc a
+    ld b, a
+    ld a, (scr_cols)
+    dec a                      ; compare against max valid col, so new=scr_cols wraps
+    cp b
+    ld a, b
+    jr nc, .store_col
+    ; Wrap: CR + LF
+    xor a
+    ld (cursor_col), a
+    jp _do_lf
+.store_col:
+    ld (cursor_col), a
+    ret
+
+.enter_esc:
+    ; Received 0x1B — enter ESC state
+    ld a, ESC_SAW_ESC
+    ld (esc_state), a
+    ret
+
+; ------------------------------------------------------------------
+; State 1: received ESC, A = command char (on stack → pop first)
+; ------------------------------------------------------------------
+.esc_dispatch:
+    pop af                     ; A = command char
+    ld b, a                    ; save command in B
+    xor a
+    ld (esc_state), a          ; default: return to NORMAL
+
+    ; --- No-param sequences ---
+    ld hl, .esc_table
+    ; Walk table: pairs of (char, target_lo, target_hi) — terminated by 0
+.tbl_loop:
+    ld a, (hl)
+    or a
+    jr z, .esc_unknown         ; end of table
+    cp b
+    jr z, .tbl_found
+    inc hl
+    inc hl
+    inc hl
+    jr .tbl_loop
+.tbl_found:
+    inc hl
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ex de, hl
+    jp (hl)                    ; jump to handler
+
+.esc_unknown:
+    ; Unknown ESC char — display it as a literal character (per manual)
+    ld a, b                    ; recover command char
+    cp 0x20
+    ret c                      ; skip non-printable unknowns
+    ; Treat as printable: write to buffer + render, advance cursor
+    push af
+    call _cursor_buf_addr
+    pop af
+    ld (hl), a
+    push af
+    call _page_in
+    pop af
+    ld b, a
+    ld a, (cursor_col)
+    ld c, a
+    ld a, (cursor_row)
+    ld d, a
+    call _render_char
+    call _page_out
+    ld a, (cursor_col)
+    inc a
+    ld b, a
+    ld a, (scr_cols)
+    dec a                      ; compare against max valid col, so new=scr_cols wraps
+    cp b
+    ld a, b
+    jr nc, .unk_store
+    xor a
+    ld (cursor_col), a
+    jp _do_lf
+.unk_store:
+    ld (cursor_col), a
+    ret
+
+; Jump table: byte cmd, word target (little-endian)
+.esc_table:
+    db 'A'
+    dw .esc_A
+    db 'B'
+    dw .esc_B
+    db 'C'
+    dw .esc_C
+    db 'D'
+    dw .esc_D
+    db 'E'
+    dw .esc_E
+    db 'H'
+    dw .esc_H
+    db 'I'
+    dw .esc_I
+    db 'J'
+    dw .esc_J
+    db 'K'
+    dw .esc_K
+    db 'L'
+    dw .esc_L
+    db 'M'
+    dw .esc_M
+    db 'N'
+    dw .esc_N
+    db 'Y'
+    dw .esc_Y_start
+    db 'X'
+    dw .esc_X_start
+    db '0'
+    dw .esc_ret         ; status line off  — ignore
+    db '1'
+    dw .esc_ret         ; status line on   — ignore
+    db '2'
+    dw .esc_1p          ; national variant — consume 1 param
+    db '3'
+    dw .esc_1p          ; screen mode      — consume 1 param
+    db '4'
+    dw .esc_1p          ; page mode        — consume 1 param
+    db '5'
+    dw .esc_1p          ; auto-flip        — consume 1 param
+    db 'b'
+    dw .esc_1p          ; fg colour        — consume 1 param
+    db 'c'
+    dw .esc_1p          ; bg colour        — consume 1 param
+    db 'd'
+    dw .esc_d
+    db 'e'
+    dw .esc_ret         ; cursor on        — ignore
+    db 'f'
+    dw .esc_ret         ; cursor off       — ignore
+    db 'j'
+    dw .esc_j
+    db 'k'
+    dw .esc_k
+    db 'l'
+    dw .esc_l
+    db 'o'
+    dw .esc_o
+    db 'p'
+    dw .esc_ret         ; reverse on       — ignore
+    db 'q'
+    dw .esc_ret         ; reverse off      — ignore
+    db 'r'
+    dw .esc_ret         ; underline on     — ignore
+    db 'u'
+    dw .esc_ret         ; underline off    — ignore
+    db 'v'
+    dw .esc_ret         ; wrap on          — ignore (default)
+    db 'w'
+    dw .esc_ret         ; wrap off         — ignore
+    db 'x'
+    dw .esc_ret         ; enter 80-col     — ignore
+    db 'y'
+    dw .esc_ret         ; leave 80-col     — ignore
+    db 0                ; end of table
+
+; ------- simple helpers -------
+.esc_ret:
+    ret
+
+.esc_1p:
+    ; Set state to consume one more byte, save cmd in esc_cmd
+    ld a, b
+    ld (esc_cmd), a
+    ld a, ESC_WAIT_1P
+    ld (esc_state), a
+    ret
+
+; ------- cursor movement -------
+.esc_A:
+    ; Cursor up (stop at row 0)
+    ld a, (cursor_row)
+    or a
+    ret z
+    dec a
+    ld (cursor_row), a
+    ret
+
+.esc_B:
+    ; Cursor down (stop at last row)
+    ld a, (cursor_row)
+    cp SCR_ROWS - 1
+    ret z
+    inc a
+    ld (cursor_row), a
+    ret
+
+.esc_C:
+    ; Cursor right (stop at last column)
+    ld a, (scr_cols)
+    dec a
+    ld b, a
+    ld a, (cursor_col)
+    cp b
+    ret z
+    inc a
+    ld (cursor_col), a
+    ret
+
+.esc_D:
+    ; Cursor left (stop at column 0)
+    ld a, (cursor_col)
+    or a
+    ret z
+    dec a
+    ld (cursor_col), a
+    ret
+
+.esc_H:
+    ; Home cursor
+    xor a
+    ld (cursor_col), a
+    ld (cursor_row), a
+    ret
+
+.esc_I:
+    ; Reverse index: cursor up; if already at row 0, scroll DOWN
+    ld a, (cursor_row)
+    or a
+    jr z, .do_scroll_down
+    dec a
+    ld (cursor_row), a
+    ret
+.do_scroll_down:
+    call _scroll_down
+    ret
+
+; ------- clear operations -------
+.esc_E:
+    ; Clear viewport (whole screen), cursor unchanged
+    ; Save cursor, clear, restore
+    ld a, (cursor_row)
+    push af
+    ld a, (cursor_col)
+    push af
+    call _clear_screen
+    pop af
+    ld (cursor_col), a
+    pop af
+    ld (cursor_row), a
+    ret
+
+.esc_J:
+    ; Erase from cursor to bottom of screen (inclusive).
+    ; _clear_row_a clobbers BC, so keep the loop counter on the stack
+    ; across each call.
+    call _erase_line_from_cursor
+    ld a, (cursor_row)
+    inc a                      ; start clearing from row+1
+.esc_J_loop:
+    cp SCR_ROWS
+    ret nc
+    push af
+    call _clear_row_a
+    pop af
+    inc a
+    jr .esc_J_loop
+
+.esc_K:
+    ; Erase from cursor to end of line (inclusive)
+    call _erase_line_from_cursor
+    ret
+
+.esc_d:
+    ; Erase from top of screen to cursor (inclusive).
+    ; _clear_row_a clobbers BC, so keep the loop counter on the stack
+    ; across the call instead of in a register.
+    ld a, (cursor_row)
+    or a
+    jr z, .esc_d_cur           ; cursor on row 0 — only clear partial row 0
+    ld b, a                    ; B = number of full rows to clear (row 0..row-1)
+    xor a                      ; A = row to clear, starting at 0
+.esc_d_loop:
+    push af
+    push bc
+    call _clear_row_a
+    pop bc
+    pop af
+    inc a
+    djnz .esc_d_loop
+.esc_d_cur:
+    ; Erase cursor row from column 0 to cursor col (inclusive)
+    call _erase_line_to_cursor
+    ret
+
+.esc_l:
+    ; Erase entire current line
+    ld a, (cursor_row)
+    call _clear_row_a
+    ret
+
+.esc_o:
+    ; Erase from start of line to cursor (inclusive)
+    call _erase_line_to_cursor
+    ret
+
+; ------- line operations -------
+.esc_L:
+    ; Insert line at cursor row: push cursor row and below DOWN by one,
+    ; losing the last row; cursor row becomes blank
+    call _insert_line
+    ret
+
+.esc_M:
+    ; Delete cursor row: pull rows below UP, blank last row
+    call _delete_line
+    ret
+
+.esc_N:
+    ; Delete char under cursor; shift rest of row left; fill last col space
+    call _delete_char
+    ret
+
+; ------- save / restore cursor -------
+.esc_j:
+    ld a, (cursor_row)
+    ld (saved_row), a
+    ld a, (cursor_col)
+    ld (saved_col), a
+    ret
+
+.esc_k:
+    ld a, (saved_row)
+    ld (cursor_row), a
+    ld a, (saved_col)
+    ld (cursor_col), a
+    ret
+
+; ------- ESC Y: absolute cursor position (2 params) -------
+.esc_Y_start:
+    ; Record that we're waiting for row param
+    ld a, ESC_WAIT_Y_ROW
+    ld (esc_state), a
+    ret
+
+.esc_y_row:
+    ; A still on stack from putchar entry; pop it, subtract 32, clamp
+    pop af                     ; A = row param byte
+    sub 0x20                   ; subtract offset
+    jr nc, .yr_ok
+    xor a
+.yr_ok:
+    cp SCR_ROWS
+    jr c, .yr_store
+    ld a, SCR_ROWS - 1
+.yr_store:
+    ld (esc_p1), a
+    ld a, ESC_WAIT_Y_COL
+    ld (esc_state), a
+    ret
+
+.esc_y_col:
+    pop af                     ; A = col param byte
+    sub 0x20
+    jr nc, .yc_ok
+    xor a
+.yc_ok:
+    ld b, a                    ; B = decoded col
+    ld a, (scr_cols)
+    cp b                       ; carry set if scr_cols < col (clamp needed)
+    jr nc, .yc_in_range        ; scr_cols >= col: OK, use B
+    dec a                      ; A = scr_cols - 1 (clamped)
+    jr .yc_store
+.yc_in_range:
+    ld a, b                    ; A = decoded col (valid)
+.yc_store:
+    ld (cursor_col), a
+    ld a, (esc_p1)
+    ld (cursor_row), a
+    xor a
+    ld (esc_state), a
+    ret
+
+; ------- ESC X: viewport (4 params — consume all, ignore) -------
+.esc_X_start:
+    ld a, ESC_WAIT_X_TR
+    ld (esc_state), a
+    ret
+
+.esc_x_tr:
+    pop af                     ; consume tr
+    ld a, ESC_WAIT_X_LC
+    ld (esc_state), a
+    ret
+
+.esc_x_lc:
+    pop af                     ; consume lc
+    ld a, ESC_WAIT_X_H
+    ld (esc_state), a
+    ret
+
+.esc_x_h:
+    pop af                     ; consume height
+    ld a, ESC_WAIT_X_W
+    ld (esc_state), a
+    ret
+
+.esc_x_w:
+    pop af                     ; consume width — final param
+    xor a
+    ld (esc_state), a
+    ret
+
+
+; ==========================================================================
+; _do_cr — Carriage return: cursor to column 0
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF
+; ==========================================================================
+; @proc _do_cr
+; @clobbers af
+; @end
+_do_cr:
+    xor a
+    ld (cursor_col), a
+    ret
+
+
+; ==========================================================================
+; _do_lf — Line feed: cursor down one row, scroll if needed
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc _do_lf
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_do_lf:
+    ld a, (cursor_row)
+    inc a
+    cp SCR_ROWS
+    jr c, .no_scroll
+    call _scroll_up            ; Clobbers AF, BC, DE, HL, IX, IY
+    ld a, SCR_ROWS - 1
+.no_scroll:
+    ld (cursor_row), a
+    ret
+
+
+; ==========================================================================
+; _do_bs — Backspace: move cursor left, erase character
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc _do_bs
+; @clobbers af,bc,de,hl,ix
+; @end
+_do_bs:
+    ld a, (cursor_col)
+    or a
+    jr nz, .back_in_row
+    ; col 0: wrap to end of previous row so BDOS fn 10 can
+    ; backspace through a line that auto-wrapped during entry.
+    ld a, (cursor_row)
+    or a
+    ret z                      ; (0,0) — nothing left to back over
+    dec a
+    ld (cursor_row), a
+    ld a, (scr_cols)           ; col = scr_cols; dec below → scr_cols-1
+.back_in_row:
+    dec a
+    ld (cursor_col), a
+
+    ; Put space in buffer at new cursor position
+    call _cursor_buf_addr      ; Clobbers AF, DE, HL → HL = addr
+    ld (hl), 0x20
+
+    ; Render space to screen
+    call _page_in              ; Clobbers AF, BC
+    ld b, 0x20                 ; B = space
+    ld a, (cursor_col)
+    ld c, a                    ; C = col
+    ld a, (cursor_row)
+    ld d, a                    ; D = row
+    call _render_char          ; Clobbers AF, BC, DE, HL, IX
+    call _page_out             ; Clobbers AF, BC
+    ret
+
+
+; ==========================================================================
+; scr_status — Console output ready status
+;   In:      nothing
+;   Out:     A = 0xFF (always ready)
+;   Clobbers: (none besides A)
+; ==========================================================================
+; @proc scr_status
+; @out   a
+; @end
+scr_status:
+    ld a, 0xFF
+    ret
+
+
+; ==========================================================================
+; _page_in — Page in screen bank (mode 2: 4,5,6,3)
+;   In:      nothing (system mode 3 active, interrupts already disabled)
+;   Out:     nothing
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc _page_in
+; @clobbers af,bc
+; @end
+_page_in:
+    ld a, (motor_flag)         ; Preserve motor state
+    or PAGING_SCREEN           ; Mode 2 (4,5,6,3)
+    jp write_1ffd              ; Tail-call (updates shadow too)
+
+
+; ==========================================================================
+; _page_out — Restore system bank (mode 3: 4,7,6,3)
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc _page_out
+; @clobbers af,bc
+; @end
+_page_out:
+    ld a, (motor_flag)         ; Preserve motor state
+    or BANK1_1FFD              ; Mode 3 (4,7,6,3)
+    jp write_1ffd              ; Tail-call (updates shadow too)
+
+
+; ==========================================================================
+; _cursor_buf_addr — Buffer address for current cursor position
+;   In:      cursor_col, cursor_row (memory)
+;   Out:     HL = &char_buffer[cursor_row * scr_cols + cursor_col]
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc _cursor_buf_addr
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+_cursor_buf_addr:
+    ld a, (cursor_row)
+    call _mul_row_scr_cols     ; HL = row * scr_cols
+    ld a, (cursor_col)
+    ld e, a
+    ld d, 0
+    add hl, de                 ; HL += col
+    ld de, char_buffer
+    add hl, de
+    ret
+
+
+; ==========================================================================
+; _mul_row_scr_cols — Compute HL = A * scr_cols
+;   In:  A = multiplier (row 0-23, or count up to SCR_ROWS)
+;   Out: HL = A * scr_cols
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc _mul_row_scr_cols
+; @param %n:u8 a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+_mul_row_scr_cols:
+    add a, a                   ; A = word index (row * 2)
+    ld c, a
+    ld b, 0
+    ld hl, row_buf_tbl
+    add hl, bc
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    ret
+
+
+; ==========================================================================
+; _render_char — Render one character to the screen bitmap
+;   In:      B = character code
+;            C = column (0-50)
+;            D = row (0-23)
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX
+;
+;   Screen must be paged in before calling.
+;   Uses memory variables _rnd_shift, _rnd_bcol, _rnd_row as temporaries.
+; ==========================================================================
+; @proc _render_char
+; @param %ch:u8  b
+; @param %col:u8 c
+; @param %row:u8 d
+; @clobbers af,bc,de,hl,ix
+; @end
+_render_char:
+    ; Save row to memory (we'll need D for other things)
+    ld a, d
+    ld (_rnd_row), a
+
+    ; --- Font data pointer → IX ---
+    ; B = char code. HL and DE are free to use.
+    ld l, b
+    ld h, 0
+    add hl, hl
+    add hl, hl
+    add hl, hl                ; HL = char × 8
+    ld de, (font_ptr)          ; DE = base of active font
+    add hl, de                 ; HL = &font[char * 8]
+    push hl
+    pop ix                     ; IX = font pointer
+
+    ; --- Branch on column mode ---
+    ld a, (scr_cols)
+    cp 32
+    jr z, .render32
+
+    ; --- 51-col path: pixel_x = col * 5, non-byte-aligned ---
+    ; C = column (0-50). Compute pixel_x = C * 5.
+    ld a, c
+    ld b, a                    ; B = column (temp)
+    add a, a                   ; ×2
+    add a, a                   ; ×4
+    add a, b                   ; ×5 (A = pixel_x, max 250)
+    ld b, a                    ; B = pixel_x
+
+    srl a
+    srl a
+    srl a                      ; A = pixel_x >> 3 = byte column
+    ld (_rnd_bcol), a
+
+    ld a, b                    ; A = pixel_x
+    and 0x07                   ; A = pixel_x & 7 = shift amount
+    ld (_rnd_shift), a
+
+    ; --- Screen base address for (row, scan 0, byte_col) ---
+    ld a, (_rnd_row)
+    call _calc_row_addr        ; HL = screen addr for (row, byte_col=0, scan 0)
+    ld a, (_rnd_bcol)
+    or l
+    ld l, a                    ; HL = screen addr for (row, byte_col, scan 0)
+
+    ; --- Render 8 scan lines (51-col, shift/spill) ---
+    ld b, 8
+.scan:
+    push bc                    ; Save loop counter (B=count)
+    push hl                    ; Save screen address
+
+    ; Get font byte (pixels in bits 7-3)
+    ld d, (ix + 0)
+    inc ix
+    ld e, 0                    ; DE = font byte : 0 (16-bit shifted value)
+
+    ; Create mask for the 5-pixel area
+    ld b, 0xF8                 ; BC = mask high : 0
+    ld c, 0
+
+    ; Shift font (DE) and mask (BC) right by _rnd_shift positions
+    ld a, (_rnd_shift)
+    or a
+    jr z, .apply               ; shift = 0: no shifting needed
+.sloop:
+    srl d
+    rr e                       ; Shift font right through DE
+    srl b
+    rr c                       ; Shift mask right through BC
+    dec a
+    jr nz, .sloop
+
+.apply:
+    ; D:E = shifted font (high:low byte)
+    ; B:C = shifted mask (high:low byte)
+    ; Stack: screen_addr, loop_counter
+
+    pop hl                     ; HL = screen address
+    push hl                    ; Re-push for later restore
+
+    ; --- First screen byte ---
+    ld a, b                    ; A = mask high byte
+    cpl                        ; Invert: 1 = bits to keep
+    and (hl)                   ; Keep non-character pixels
+    or d                       ; Merge in font pixels
+    ld (hl), a
+
+    ; --- Second screen byte (if character spills across byte boundary) ---
+    ld a, e
+    or c                       ; Any spill bits? (font low OR mask low)
+    jr z, .no_spill
+    inc l                      ; Next byte column
+    ld a, c                    ; A = mask low byte
+    cpl
+    and (hl)                   ; Keep non-character pixels
+    or e                       ; Merge in font spill pixels
+    ld (hl), a
+
+.no_spill:
+    pop hl                     ; Restore screen address
+    inc h                      ; Next scan line (SSS += 1)
+    pop bc                     ; Restore loop counter
+    djnz .scan
+
+    ret
+
+.render32:
+    ; --- 32-col path: col * 8, byte-aligned, direct write ---
+    ; byte_col = column (col*8>>3 = col), shift always 0
+    ld a, (_rnd_row)
+    call _calc_row_addr        ; HL = screen addr for (row, byte_col=0, scan 0)
+    ld a, c                    ; byte_col = column for 8px chars
+    or l
+    ld l, a
+
+    ; --- Render 8 scan lines (byte-aligned, direct) ---
+    ld b, 8
+.scan32:
+    ld a, (ix)
+    inc ix
+    ld (hl), a
+    inc h                      ; Next scan line
+    djnz .scan32
+
+    ret
+
+
+; ==========================================================================
+; _scroll_up — Scroll screen up by one text row, clear bottom row
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+;
+;   Fast pixel-level scroll: moves screen bitmap up by 8 pixel rows
+;   (one character row) using LDIR on each scan line. Handles the
+;   Spectrum's interleaved screen layout (thirds + scan lines).
+;   Much faster than redrawing all 1224 characters.
+; ==========================================================================
+; @proc _scroll_up
+; @clobbers af,bc,de,hl
+; @end
+_scroll_up:
+    ; Scroll character buffer: rows 1-23 → rows 0-22
+    ; HL = char_buffer + scr_cols (source = start of row 1)
+    ld a, (scr_cols)
+    ld e, a
+    ld d, 0
+    ld hl, char_buffer
+    add hl, de                  ; HL = char_buffer + scr_cols
+    ld de, char_buffer          ; DE = char_buffer (dest = row 0)
+    ; BC = scr_cols * 23
+    push de
+    push hl
+    ld a, 23
+    call _mul_row_scr_cols      ; HL = scr_cols * 23
+    ld b, h
+    ld c, l
+    pop hl
+    pop de
+    ldir
+
+    ; Clear bottom row in buffer: HL = char_buffer + scr_cols * 23
+    ld a, 23
+    call _mul_row_scr_cols      ; HL = scr_cols * 23
+    ld de, char_buffer
+    add hl, de                  ; HL = char_buffer + 23*scr_cols
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0x20
+    ld a, (scr_cols)
+    ld c, a
+    ld b, 0
+    dec bc                      ; BC = scr_cols - 1
+    ldir
+
+    ; Fast pixel scroll on the actual screen bitmap
+    call _page_in
+
+    ; Scroll 23 character rows up by one row (184 pixel rows)
+    ; For each character row R (0-22), copy row R+1's 8 scan lines to row R.
+    ;
+    ; Screen address for char row R, scan S:
+    ;   H = 0x40 | (third << 3) | scan
+    ;   L = (row_in_third << 5)
+    ;   third = R / 8, row_in_third = R & 7
+    ;
+    ; We process 23 character rows. For each, copy 8 scan lines × 32 bytes.
+
+    ld a, 0
+    ld (_scroll_row_ctr), a
+
+.scroll_row:
+    ; Calculate dest (current row) and source (current row + 1)
+    ld a, (_scroll_row_ctr)
+    call _calc_row_addr        ; HL = dest row, scan 0
+    push hl
+
+    ld a, (_scroll_row_ctr)
+    inc a
+    call _calc_row_addr        ; HL = source row+1, scan 0
+    pop de                     ; DE = dest, HL = source
+
+    ; Copy 8 scan lines × 32 bytes
+    ld b, 8
+.scroll_scan:
+    push bc
+    push hl
+    push de
+    ld bc, 32
+    ldir
+    pop de
+    pop hl
+    inc h                      ; Source next scan line (SSS += 1)
+    inc d                      ; Dest next scan line
+    pop bc
+    djnz .scroll_scan
+
+    ; Next character row
+    ld a, (_scroll_row_ctr)
+    inc a
+    ld (_scroll_row_ctr), a
+    cp SCR_ROWS - 1            ; Done 23 rows?
+    jr c, .scroll_row
+
+    jr _scroll_clear
+
+_scroll_row_ctr: db 0
+
+; Helper: calculate screen address for character row A, scan line 0
+;   In:  A = character row (0-23)
+;   Out: HL = screen address
+;   Clobbers: AF
+; @proc _calc_row_addr
+; @param %row:u8 a
+; @out   hl
+; @clobbers af
+; @end
+_calc_row_addr:
+    push de
+    add a, a                   ; A = word index (row * 2)
+    ld e, a
+    ld d, 0
+    ld hl, _row_scr_tbl
+    add hl, de
+    ld a, (hl)
+    inc hl
+    ld h, (hl)
+    ld l, a
+    pop de
+    ret
+
+; Row → screen-address table. For char row r at scan 0, byte col 0:
+;   H = 0x40 | ((r>>3) << 3),  L = (r & 7) << 5
+_row_scr_tbl:
+    dw 0x4000, 0x4020, 0x4040, 0x4060, 0x4080, 0x40A0, 0x40C0, 0x40E0
+    dw 0x4800, 0x4820, 0x4840, 0x4860, 0x4880, 0x48A0, 0x48C0, 0x48E0
+    dw 0x5000, 0x5020, 0x5040, 0x5060, 0x5080, 0x50A0, 0x50C0, 0x50E0
+
+; @proc _scroll_clear
+; @clobbers af,bc,de,hl
+; @end
+_scroll_clear:
+    ; Clear bottom character row (row 23) — 8 scan lines × 32 bytes = 0
+    ld a, 23
+    call _calc_row_addr        ; HL = row 23, scan 0
+    ld b, 8
+.clear_scan:
+    push bc
+    push hl
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0
+    ld bc, 31
+    ldir
+    pop hl
+    inc h                      ; Next scan line
+    pop bc
+    djnz .clear_scan
+
+    ; Scroll attributes: rows 1-23 → 0-22, clear row 23
+    ; Attributes are linear: 32 bytes per row at 5800h
+    ld hl, SCR_ATTR + 32       ; Source: attr row 1
+    ld de, SCR_ATTR             ; Dest: attr row 0
+    ld bc, 23 * 32              ; 23 rows
+    ldir
+    ; Clear bottom attr row
+    ld a, (scr_attr)
+    ld hl, SCR_ATTR + 23 * 32
+    ld de, SCR_ATTR + 23 * 32 + 1
+    ld (hl), a
+    ld bc, 31
+    ldir
+
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _scroll_down — Scroll screen down one text row; blank top row
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+;
+;   Mirror of _scroll_up but in the opposite direction.
+; ==========================================================================
+; @proc _scroll_down
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_scroll_down:
+    ; Scroll char_buffer: rows 0-22 → rows 1-23
+    ; LDDR source end = char_buffer + scr_cols*22 + scr_cols-1 = scr_cols*23-1
+    ; LDDR dest end   = char_buffer + scr_cols*23 + scr_cols-1 = scr_cols*24-1
+    ; count = scr_cols*23
+    ld a, 23
+    call _mul_row_scr_cols      ; HL = scr_cols * 23
+    push hl                     ; save count
+    ; source end = char_buffer + scr_cols*23 - 1
+    ld de, char_buffer - 1
+    add hl, de                  ; HL = source end
+    ; dest end = source end + scr_cols
+    ld de, 0
+    ld a, (scr_cols)
+    ld e, a
+    ex de, hl
+    add hl, de                  ; HL = dest end (source end + scr_cols)
+    ex de, hl                   ; DE = dest end, HL = source end
+    pop bc                      ; BC = count
+    lddr
+
+    ; Clear top row in buffer
+    ld hl, char_buffer
+    ld de, char_buffer + 1
+    ld (hl), 0x20
+    ld a, (scr_cols)
+    ld c, a
+    ld b, 0
+    dec bc                      ; BC = scr_cols - 1
+    ldir
+
+    ; Pixel scroll: rows 0-22 → 1-23 (move each row down one)
+    call _page_in
+
+    ; Copy rows 22 down to 23, then 21 to 22, … 0 to 1
+    ld a, SCR_ROWS - 2          ; start at source row 22
+    ld (_scroll_row_ctr), a
+.sd_row:
+    ld a, (_scroll_row_ctr)
+    call _calc_row_addr         ; HL = source row, scan 0
+    push hl
+    ld a, (_scroll_row_ctr)
+    inc a                       ; dest = source + 1
+    call _calc_row_addr         ; HL = dest row, scan 0
+    pop de                      ; DE = source, HL = dest (swap roles)
+    ; Actually we want to copy DE (source) to HL (dest)
+    ; _calc_row_addr returns source in HL; we need DE=source, HL=dest
+    ; Currently: DE = source (from push/pop), HL = dest
+    ; Swap so ldir works: HL=src, DE=dst
+    push hl                     ; push dest
+    ex de, hl                   ; HL = source (old DE), DE = dest (discarded)
+    pop de                      ; DE = dest
+    ; HL = source, DE = dest — correct for ldir
+    ld b, 8
+.sd_scan:
+    push bc
+    push hl
+    push de
+    ld bc, 32
+    ldir
+    pop de
+    pop hl
+    inc h                       ; source: next scan line
+    inc d                       ; dest: next scan line
+    pop bc
+    djnz .sd_scan
+
+    ld a, (_scroll_row_ctr)
+    or a
+    jr z, .sd_done
+    dec a
+    ld (_scroll_row_ctr), a
+    jr .sd_row
+
+.sd_done:
+    ; Clear top row pixels (row 0)
+    ld a, 0
+    call _calc_row_addr         ; HL = row 0, scan 0
+    ld b, 8
+.sd_clear_scan:
+    push bc
+    push hl
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0
+    ld bc, 31
+    ldir
+    pop hl
+    inc h
+    pop bc
+    djnz .sd_clear_scan
+
+    ; Scroll attributes down: rows 0-22 → 1-23
+    ld hl, SCR_ATTR + 22 * 32   ; source: attr row 22
+    ld de, SCR_ATTR + 23 * 32   ; dest: attr row 23
+    ld bc, 23 * 32
+    lddr
+    ; Clear top attr row
+    ld a, (scr_attr)
+    ld hl, SCR_ATTR
+    ld de, SCR_ATTR + 1
+    ld (hl), a
+    ld bc, 31
+    ldir
+
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _clear_screen — Clear entire screen (char_buffer + pixels + attrs)
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc _clear_screen
+; @clobbers af,bc,de,hl
+; @end
+_clear_screen:
+    ; Clear char_buffer
+    ld hl, char_buffer
+    ld de, char_buffer + 1
+    ld (hl), 0x20
+    ld bc, SCR_COLS_MAX * SCR_ROWS - 1
+    ldir
+
+    call _page_in
+
+    ; Clear bitmap
+    ld hl, SCR_BASE
+    ld de, SCR_BASE + 1
+    ld (hl), 0
+    ld bc, 6143
+    ldir
+
+    ; Restore attributes
+    ld a, (scr_attr)
+    ld hl, SCR_ATTR
+    ld de, SCR_ATTR + 1
+    ld (hl), a
+    ld bc, 767
+    ldir
+
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _clear_row_a — Clear row A in char_buffer and pixel screen
+;   In:      A = row to clear (0-23)
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc _clear_row_a
+; @param %row:u8 a
+; @clobbers af,bc,de,hl
+; @end
+_clear_row_a:
+    ld (_cra_row), a            ; save row for pixel phase
+
+    ; Clear row in char_buffer: offset = A * scr_cols
+    call _mul_row_scr_cols      ; HL = row * scr_cols
+    ld de, char_buffer
+    add hl, de                  ; HL = &char_buffer[row * scr_cols]
+    ld d, h
+    ld e, l
+    inc de                      ; DE = HL + 1
+    ld (hl), 0x20
+    ld a, (scr_cols)
+    ld c, a
+    ld b, 0
+    dec bc                      ; BC = scr_cols - 1
+    ldir
+
+    ; Clear row pixels
+    ld a, (_cra_row)
+    call _calc_row_addr         ; HL = pixel row addr, scan 0
+
+    call _page_in
+
+    ld b, 8
+._cra_scan:
+    push bc                     ; lint: ignore  (only B is used; C pushed/popped as padding)
+    push hl
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0
+    ld bc, 31
+    ldir
+    pop hl
+    inc h
+    pop bc
+    djnz ._cra_scan
+
+    call _page_out
+    ret
+
+_cra_row: db 0                  ; scratch for _clear_row_a row value
+
+
+; ==========================================================================
+; _erase_line_from_cursor — Erase cursor col..SCR_COLS-1 on cursor row
+;   In:      cursor_col, cursor_row
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc _erase_line_from_cursor
+; @clobbers af,bc,de,hl,ix
+; @end
+_erase_line_from_cursor:
+    ; Fill char_buffer from (row, col) to end of row with spaces
+    call _cursor_buf_addr       ; HL = &char_buffer[row*scr_cols+col]
+    ld a, (cursor_col)
+    ld b, a                     ; B = start col
+    ld a, (scr_cols)
+    ld c, a                     ; C = scr_cols
+    ; count = scr_cols - cursor_col
+    ld a, c
+    sub b                       ; A = count
+    or a
+    ret z
+    ld b, a                     ; B = count
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0x20
+    dec b
+    ld c, b
+    ld b, 0
+    ; BC = count - 1, if count was 1 then BC = 0 and no ldir needed
+    ld a, c
+    or b
+    jr z, .elfc_render
+    ldir
+.elfc_render:
+    ; Re-render the erased section on screen
+    call _page_in
+    ld a, (cursor_col)
+    ld c, a                     ; C = start col
+    ld a, (cursor_row)
+    ld d, a                     ; D = row
+.elfc_col:
+    ld b, 0x20                  ; space
+    push bc
+    push de
+    call _render_char
+    pop de
+    pop bc
+    inc c
+    ld a, (scr_cols)
+    cp c                        ; Z when c==scr_cols (done)
+    jr nz, .elfc_col
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _erase_line_to_cursor — Erase col 0..cursor_col on cursor row
+;   In:      cursor_col, cursor_row
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc _erase_line_to_cursor
+; @clobbers af,bc,de,hl,ix
+; @end
+_erase_line_to_cursor:
+    ; Fill char_buffer from start of row to (row, cursor_col) inclusive
+    ld a, (cursor_row)
+    call _mul_row_scr_cols      ; HL = row * scr_cols
+    ld de, char_buffer
+    add hl, de                  ; HL = &char_buffer[row*scr_cols]
+    ld a, (cursor_col)
+    inc a                       ; count = cursor_col + 1
+    ld b, a
+    ld d, h
+    ld e, l
+    inc de
+    ld (hl), 0x20
+    dec b
+    jr z, .eltc_render
+    ld c, b
+    ld b, 0
+    ldir
+.eltc_render:
+    ; Re-render on screen
+    call _page_in
+    ld c, 0                     ; start at col 0
+    ld a, (cursor_row)
+    ld d, a
+.eltc_col:
+    ld b, 0x20
+    push bc
+    push de
+    call _render_char
+    pop de
+    pop bc
+    ld a, c
+    ld e, a
+    ld a, (cursor_col)
+    cp e
+    jr z, .eltc_done
+    inc c
+    jr .eltc_col
+.eltc_done:
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _insert_line — Insert blank line at cursor row; push rows down; lose row 23
+;   In:      cursor_row
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc _insert_line
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_insert_line:
+    ld a, (cursor_row)
+    ld (_il_row), a
+
+    ; char_buffer: LDDR rows cursor_row..SCR_ROWS-2 down by one row
+    ;              count = (SCR_ROWS-1 - cursor_row) * scr_cols
+    ld b, a                     ; B = cursor_row
+    ld a, SCR_ROWS - 1
+    sub b                       ; A = SCR_ROWS-1 - cursor_row
+    jr z, .il_blank             ; at last row: nothing to push
+    call _mul_row_scr_cols      ; HL = (SCR_ROWS-1 - cursor_row) * scr_cols
+    ld b, h
+    ld c, l                     ; BC = byte count
+    ; Source end = char_buffer + scr_cols*23 - 1
+    push bc
+    ld a, 23
+    call _mul_row_scr_cols      ; HL = scr_cols * 23
+    ld de, char_buffer - 1
+    add hl, de                  ; HL = char_buffer + scr_cols*23 - 1 (source end)
+    ; Dest end = source end + scr_cols
+    ld de, 0
+    ld a, (scr_cols)
+    ld e, a
+    ex de, hl
+    add hl, de                  ; HL = dest end (source end + scr_cols)
+    ex de, hl                   ; DE = dest end, HL = source end
+    pop bc
+    lddr
+
+.il_blank:
+    ; Blank cursor row in buffer + screen
+    ld a, (_il_row)
+    call _clear_row_a
+
+    ; Redraw all (buffer is now correct for all rows)
+    call _page_in
+    call _redraw_all_screenpaged
+    call _page_out
+    ret
+
+_il_row: db 0
+
+
+; ==========================================================================
+; _delete_line — Delete cursor row; pull rows below up; blank last row
+;   In:      cursor_row
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc _delete_line
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_delete_line:
+    ld a, (cursor_row)
+    ld (_dl_row), a
+    ld b, a                     ; B = cursor_row
+
+    ; char_buffer: LDIR from &char_buffer[(cursor_row+1)*scr_cols]
+    ;              to   &char_buffer[cursor_row*scr_cols]
+    ;              count = (SCR_ROWS-1 - cursor_row) * scr_cols
+    ld a, SCR_ROWS - 1
+    sub b                       ; A = SCR_ROWS-1 - cursor_row
+    jr z, .dl_blank             ; cursor at last row: just blank it
+
+    call _mul_row_scr_cols      ; HL = (SCR_ROWS-1 - cursor_row) * scr_cols
+    ld b, h
+    ld c, l                     ; BC = byte count
+
+    ; dest = &char_buffer[cursor_row * scr_cols]
+    ld a, (_dl_row)
+    push bc
+    call _mul_row_scr_cols      ; HL = cursor_row * scr_cols
+    ld de, char_buffer
+    add hl, de                  ; HL = dest (char_buffer + cursor_row*scr_cols)
+    ld d, h
+    ld e, l                     ; DE = dest
+    ; source = dest + scr_cols
+    ld a, (scr_cols)
+    ld c, a
+    ld b, 0
+    add hl, bc                  ; HL = source = dest + scr_cols
+    pop bc                      ; BC = count
+    ldir
+
+.dl_blank:
+    ; Clear last row in buffer + screen
+    ld a, SCR_ROWS - 1
+    call _clear_row_a
+
+    ; Redraw screen
+    call _page_in
+    call _redraw_all_screenpaged
+    call _page_out
+    ret
+
+_dl_row: db 0
+
+
+; ==========================================================================
+; _delete_char — Delete char at cursor; shift rest of row left; fill end space
+;   In:      cursor_col, cursor_row
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX
+; ==========================================================================
+; @proc _delete_char
+; @clobbers af,bc,de,hl,ix
+; @end
+_delete_char:
+    ; Shift char_buffer[row][col+1..SCR_COLS-1] → [col..SCR_COLS-2]
+    call _cursor_buf_addr       ; HL = &char_buffer[row*51+col]
+    ld d, h
+    ld e, l
+    inc hl                      ; HL = source (col+1)
+    ld a, (cursor_col)
+    ld b, a
+    ld a, (scr_cols)
+    dec a
+    sub b                       ; A = scr_cols-1 - cursor_col = chars to move
+    or a
+    jr z, .dc_fill              ; cursor at last col: just fill
+    ld c, a
+    ld b, 0
+    ldir                        ; shift left (DE=dest, HL=source)
+
+.dc_fill:
+    ; Last column of the row = space
+    ; Recompute &char_buffer[row*scr_cols + scr_cols-1]
+    ld a, (cursor_row)
+    call _mul_row_scr_cols      ; HL = row * scr_cols
+    ld de, char_buffer
+    add hl, de                  ; HL = &char_buffer[row*scr_cols]
+    ld a, (scr_cols)
+    dec a
+    ld e, a
+    ld d, 0
+    add hl, de                  ; HL = &char_buffer[row*scr_cols + scr_cols-1]
+    ld (hl), 0x20
+
+    ; Re-render cursor_col..scr_cols-1 from char_buffer
+    ld a, (cursor_row)
+    call _mul_row_scr_cols      ; HL = row * scr_cols
+    ld de, char_buffer
+    add hl, de
+    ld a, (cursor_col)
+    ld e, a
+    ld d, 0
+    add hl, de                  ; HL = &char_buffer[row*scr_cols + cursor_col]
+
+    call _page_in
+    ld a, (cursor_col)
+    ld c, a                     ; C = col counter
+    ld a, (cursor_row)
+    ld d, a                     ; D = row (constant)
+.dc_col:
+    ld b, (hl)                  ; B = char from buffer
+    inc hl                      ; advance buffer pointer
+    push bc
+    push de
+    push hl
+    call _render_char           ; B=char, C=col, D=row
+    pop hl
+    pop de
+    pop bc
+    inc c
+    ld a, (scr_cols)
+    cp c                        ; Z when c == scr_cols (done)
+    jr nz, .dc_col
+    call _page_out
+    ret
+
+
+; ==========================================================================
+; _redraw_all_screenpaged — Redraw entire screen (screen must be paged in)
+;   In:      screen paged in
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc _redraw_all_screenpaged
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_redraw_all_screenpaged:
+    ; Clear bitmap
+    ld hl, SCR_BASE
+    ld de, SCR_BASE + 1
+    ld (hl), 0
+    ld bc, 6143
+    ldir
+    ; Render each character
+    ld iy, char_buffer
+    ld d, 0
+._ras_row:
+    ld c, 0
+._ras_col:
+    ld b, (iy + 0)
+    inc iy
+    push de
+    push bc
+    push iy
+    call _render_char
+    pop iy
+    pop bc
+    pop de
+    inc c
+    ld a, (scr_cols)
+    cp c                        ; Z when c == scr_cols (done with row)
+    jr nz, ._ras_col
+    inc d
+    ld a, d
+    cp SCR_ROWS
+    jr c, ._ras_row
+    ret
+
+
+; ==========================================================================
+; _redraw_all — Redraw entire screen from char_buffer
+;   In:      screen must be paged in
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL, IX, IY
+; ==========================================================================
+; @proc _redraw_all
+; @clobbers af,bc,de,hl,ix,iy
+; @end
+_redraw_all:
+    ; Clear bitmap
+    ld hl, SCR_BASE
+    ld de, SCR_BASE + 1
+    ld (hl), 0
+    ld bc, 6143
+    ldir
+
+    ; Render each character
+    ld iy, char_buffer
+    ld d, 0                    ; D = row counter
+.rrow:
+    ld c, 0                    ; C = column counter
+.rcol:
+    ld b, (iy + 0)            ; B = character from buffer
+    inc iy
+    ; _render_char needs B=char, C=col, D=row
+    ; It clobbers AF, BC, DE, HL, IX — we need to save C (col), D (row), IY
+    push de                    ; Save D (row) — E is don't-care
+    push bc                    ; Save C (col) — B will be consumed
+    push iy                    ; Save buffer pointer
+    call _render_char          ; Clobbers AF, BC, DE, HL, IX
+    pop iy
+    pop bc                     ; Restore C (col in C)
+    pop de                     ; Restore D (row in D)
+    inc c
+    ld a, (scr_cols)
+    cp c                        ; Z when c == scr_cols (done with row)
+    jr nz, .rcol
+    inc d
+    ld a, d
+    cp SCR_ROWS
+    jr c, .rrow
+    ret
+
+
+; ##########################################################################
+; XBIOS Terminal Emulator (TE) and Screen (SCR) Functions
+; ##########################################################################
+
+
+; ==========================================================================
+; te_ask — Get viewport geometry and cursor position
+;   In:      nothing
+;   Out:     B = viewport top row (0)
+;            C = viewport left column (0)
+;            D = viewport height - 1
+;            E = viewport width - 1
+;            H = cursor row within viewport
+;            L = cursor column within viewport
+;   Clobbers: AF
+; ==========================================================================
+; @proc te_ask
+; @out   bc,de,hl
+; @clobbers af
+; @end
+te_ask:
+    ld b, 0
+    ld c, 0
+    ld d, SCR_ROWS - 1
+    ld a, (scr_cols)
+    dec a
+    ld e, a
+    ld a, (cursor_row)
+    ld h, a
+    ld a, (cursor_col)
+    ld l, a
+    ret
+
+
+; ==========================================================================
+; te_reset — Reinitialise terminal to default state
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc te_reset
+; @clobbers af,bc,de,hl
+; @end
+te_reset:
+    ; Reset colour state to defaults
+    ld a, 7
+    ld (scr_ink), a
+    ld a, 1
+    ld (scr_paper), a
+    xor a
+    ld (scr_ink_br), a
+    ld (scr_paper_br), a
+    ld (scr_flash), a
+    call _rebuild_attr
+    ; Reset border
+    ld a, BORDER_COL
+    ld (scr_border_v), a
+    out (PORT_ULA), a
+    ; Clear screen and reset cursor
+    jp scr_init
+
+
+; ==========================================================================
+; scr_set_cols — Set screen column count and clear screen (BIOS function 32)
+;   In:  A = desired columns (32 or 51)
+;   Out: nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc scr_set_cols
+; @param %cols:u8 a
+; @clobbers af,bc,de,hl
+; @end
+scr_set_cols:
+    cp 32
+    jr z, .valid
+    cp 51
+    jr z, .valid
+    ret                         ; ignore invalid values silently
+.valid:
+    ld (scr_cols), a            ; update runtime column count
+    dec a
+    ld (scb_conwidth), a        ; update SCB offset 0x1A (cols - 1)
+    ld hl, 0x8000               ; default: 51-col font in bank 6
+    ld a, (scr_cols)
+    cp 32
+    jr nz, .setfont
+    ld hl, 0x8800               ; 32-col uses 8px-wide font in bank 6
+.setfont:
+    ld (font_ptr), hl
+    jp scr_init                 ; clear screen, reset cursor (tail call)
+
+
+; ==========================================================================
+; te_stl_ask — Query status line state (stub: always disabled)
+;   In:      nothing
+;   Out:     A = 0x00 (disabled)
+;            Zero flag set (not visible)
+;            Carry clear
+;   Clobbers: AF
+; ==========================================================================
+; @proc te_stl_ask
+; @out   a
+; @clobbers af
+; @end
+te_stl_ask:
+    xor a                          ; A = 0, Z set, C clear
+    ret
+
+
+; ==========================================================================
+; te_stl_on_off — Enable/disable status line (stub: no-op)
+;   In:      A = 0x00 to disable, 0xFF to enable
+;   Out:     nothing
+;   Clobbers: (none)
+; ==========================================================================
+; @proc te_stl_on_off
+; @param %enable:u8 a
+; @end
+te_stl_on_off:
+    ret
+
+
+; ==========================================================================
+; te_set_ink — Set ink or paper colour
+;   In:      A = 0 for paper/background, 1 for ink/foreground
+;            B = primary colour (6-bit XBIOS: GG RR BB)
+;            C = secondary colour (6-bit; flash if B != C)
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc te_set_ink
+; @param %sel:u8 a
+; @param %primary:u8 b
+; @param %secondary:u8 c
+; @clobbers af,bc,de,hl
+; @end
+te_set_ink:
+    push af                        ; save selector (0=paper, 1=ink)
+    push bc                        ; save B=primary, C=secondary
+
+    ; Convert primary colour
+    ld a, b
+    call _xbios_to_spectrum        ; A = bit3:bright, bits2:0=GRB
+    ld d, a                        ; D = primary result
+
+    ; Convert secondary colour
+    pop bc                         ; restore C
+    ld a, c
+    call _xbios_to_spectrum
+    ld e, a                        ; E = secondary result
+
+    ; Flash if primary != secondary
+    ld a, d
+    cp e
+    ld c, 0
+    jr z, .no_flash
+    ld c, 0x80
+.no_flash:
+    ld a, c
+    ld (scr_flash), a
+
+    ; Extract colour (bits 2:0) and bright (bit 3) from primary
+    ld a, d
+    and 0x07
+    ld b, a                        ; B = colour 0-7
+    ld a, d
+    and 0x08
+    rrca
+    rrca
+    rrca                           ; bit 3 → bit 0: A = 0 or 1
+    ld c, a                        ; C = bright flag
+
+    pop af                         ; A = selector (0=paper, 1=ink)
+    or a
+    jr nz, .is_ink
+
+    ; Paper
+    ld a, b
+    ld (scr_paper), a
+    ld a, c
+    ld (scr_paper_br), a
+    jr .apply
+
+.is_ink:
+    ld a, b
+    ld (scr_ink), a
+    ld a, c
+    ld (scr_ink_br), a
+
+.apply:
+    call _rebuild_attr
+    call _apply_screen_attr
+    ret
+
+
+; ==========================================================================
+; te_set_border — Set border colour
+;   In:      B = colour (6-bit XBIOS encoding)
+;   Out:     nothing
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc te_set_border
+; @param %colour:u8 b
+; @clobbers af,bc
+; @end
+te_set_border:
+    ld a, b
+    call _xbios_to_spectrum        ; A = bright+GRB
+    and 0x07                       ; Border has no bright bit
+    ld (scr_border_v), a
+    out (PORT_ULA), a
+    ret
+
+
+; ==========================================================================
+; te_set_speed — Set colour flash period (no-op on Spectrum)
+;   In:      H = main colour duration, L = alternate duration
+;   Out:     nothing
+;   Clobbers: (none)
+; ==========================================================================
+; @proc te_set_speed
+; @end
+te_set_speed:
+    ret
+
+
+; ==========================================================================
+; scr_run_routine — Call routine with screen memory paged in
+;   In:      BC = routine address (common memory)
+;            DE, HL, IX, IY = passed through to routine
+;   Out:     AF, DE, HL, IX, IY = as returned by routine
+;   Clobbers: BC
+; lint-exempt: stack   (uses push/push/ret to tail-call and re-enter at .after)
+; ==========================================================================
+; @proc scr_run_routine
+; @param %routine:u16 bc
+; @out   af,de,hl,ix,iy
+; @clobbers bc
+; @end
+scr_run_routine:
+    ld (_scr_run_target), bc       ; Save routine address
+    call _page_in                  ; Clobbers AF, BC; DE/HL/IX/IY intact
+    ld bc, .after
+    push bc                        ; Push return address
+    ld bc, (_scr_run_target)
+    push bc                        ; Push routine address
+    ret                            ; "call" routine
+.after:
+    ; AF, DE, HL, IX, IY = routine's return values
+    push af                        ; Protect routine's AF
+    call _page_out                 ; Clobbers AF, BC
+    pop af                         ; Restore routine's AF
+    ret
+
+_scr_run_target: dw 0
+
+
+; ==========================================================================
+; _xbios_to_spectrum — Convert 6-bit XBIOS colour to Spectrum colour
+;   In:      A = 6-bit colour (bits 5:4=green, 3:2=red, 1:0=blue)
+;   Out:     A = bit 3: bright, bits 2:0: GRB (Spectrum order)
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc _xbios_to_spectrum
+; @param %colour:u8 a
+; @out   a
+; @clobbers af,bc
+; @end
+_xbios_to_spectrum:
+    ld b, a                        ; Save input
+    ld c, 0                        ; Result accumulator
+
+    ; Green (bits 5-4) → result bit 2
+    and 0x30
+    jr z, .g_off
+    set 2, c
+    cp 0x30
+    jr nz, .g_off
+    set 3, c                      ; Bright
+.g_off:
+
+    ; Red (bits 3-2) → result bit 1
+    ld a, b
+    and 0x0C
+    jr z, .r_off
+    set 1, c
+    cp 0x0C
+    jr nz, .r_off
+    set 3, c
+.r_off:
+
+    ; Blue (bits 1-0) → result bit 0
+    ld a, b
+    and 0x03
+    jr z, .b_off
+    set 0, c
+    cp 0x03
+    jr nz, .b_off
+    set 3, c
+.b_off:
+
+    ld a, c
+    ret
+
+
+; ==========================================================================
+; _rebuild_attr — Build scr_attr from colour components
+;   In:      scr_ink, scr_paper, scr_ink_br, scr_paper_br, scr_flash
+;   Out:     scr_attr updated
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc _rebuild_attr
+; @clobbers af,bc
+; @end
+_rebuild_attr:
+    ld a, (scr_flash)             ; 0x00 or 0x80
+    ld b, a
+
+    ; Bright if either ink or paper is bright
+    ld a, (scr_ink_br)
+    or a
+    jr nz, .bright
+    ld a, (scr_paper_br)
+    or a
+    jr z, .no_bright
+.bright:
+    set 6, b
+.no_bright:
+
+    ; Paper colour into bits 5:3
+    ld a, (scr_paper)
+    rlca
+    rlca
+    rlca
+    and 0x38                       ; Mask to bits 5:3 only
+    or b
+    ld b, a
+
+    ; Ink colour into bits 2:0
+    ld a, (scr_ink)
+    and 0x07
+    or b
+    ld (scr_attr), a
+    ret
+
+
+; ==========================================================================
+; _apply_screen_attr — Fill entire screen attribute area with scr_attr
+;   In:      scr_attr set
+;   Out:     nothing
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc _apply_screen_attr
+; @clobbers af,bc,de,hl
+; @end
+_apply_screen_attr:
+    call _page_in
+    ld a, (scr_attr)
+    ld hl, SCR_ATTR
+    ld de, SCR_ATTR + 1
+    ld (hl), a
+    ld bc, 767
+    ldir
+    call _page_out
+    ret
+
+
+; ##########################################################################
+; XBIOS CD Group — Character Devices / Miscellaneous
+; ##########################################################################
+
+
+; ==========================================================================
+; cd_sa_init — RS-232 init (stub — no serial hardware)
+;   In:      various (see XBIOS docs)
+;   Out:     nothing
+;   Clobbers: (none)
+; ==========================================================================
+; @proc cd_sa_init
+; @end
+cd_sa_init:
+    ret
+
+
+; ==========================================================================
+; cd_sa_baud — RS-232 baud rate (stub — no serial hardware)
+;   In:      H = rx baud code, L = tx baud code
+;   Out:     nothing
+;   Clobbers: (none)
+; ==========================================================================
+; @proc cd_sa_baud
+; @end
+cd_sa_baud:
+    ret
+
+
+; ==========================================================================
+; cd_sa_params — RS-232 current config (stub — returns defaults)
+;   In:      nothing
+;   Out:     A = 0x00 (no handshake), B = 14 (9600), C = 14 (9600)
+;            D = 0 (1 stop bit), E = 0 (no parity)
+;            H = 8 (rx bits), L = 8 (tx bits)
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc cd_sa_params
+; @out   a,bc,de,hl
+; @clobbers af,bc,de,hl
+; @end
+cd_sa_params:
+    xor a                          ; A = 0 (no handshake)
+    ld b, 14                       ; 9600 baud
+    ld c, 14
+    ld d, 0                        ; 1 stop bit
+    ld e, 0                        ; No parity
+    ld h, 8                        ; 8 data bits rx
+    ld l, 8                        ; 8 data bits tx
+    ret
+
+
+; ==========================================================================
+; cd_version — Return machine type and BIOS version
+;   In:      nothing
+;   Out:     A = 3 (Spectrum +3)
+;            B = BIOS major version
+;            C = BIOS minor version
+;   Clobbers: AF, BC
+; ==========================================================================
+; @proc cd_version
+; @out   a,bc
+; @clobbers af,bc
+; @end
+cd_version:
+    ld a, 3                        ; Machine type: Spectrum +3
+    ld b, 1                        ; Major version
+    ld c, 0                        ; Minor version
+    ret
+
+
+; ==========================================================================
+; cd_info — Return hardware configuration
+;   In:      nothing
+;   Out:     A = 0x00 (one drive)
+;            B = 8 (128K = 8 × 16K pages)
+;            C = 0x00 (no serial port)
+;            D = 0x00 (drive B: not fitted)
+;            E = 0x05 (drive A: single-sided, 40-track, 3-inch)
+;            HL = address of buffer table (terminated, common memory)
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc cd_info
+; @out   a,bc,de,hl
+; @clobbers af,bc,de,hl
+; @end
+cd_info:
+    xor a                          ; A = 0 (one drive)
+    ld b, 8                        ; 128K RAM
+    ld c, 0                        ; No serial
+    ld d, 0                        ; Drive B: absent
+    ld e, 0x05                     ; Drive A: SS(1) | 40T(1<<2) | 3-inch(0<<5)
+    ld hl, _cd_buftable
+    ret
+
+_cd_buftable:
+    db 0xFF                        ; Empty buffer table (terminated)
+
+
+; ==========================================================================
+; find_fid — Search for FID driver by name (stub — no FIDs loaded)
+;   In:      DE = 8-char driver name (common memory)
+;   Out:     Carry clear (not found), HL corrupt
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc find_fid
+; @param %name:u16 de
+; @out   carry
+; @clobbers af,bc,de,hl
+; @end
+find_fid:
+    or a                           ; Clear carry (not found)
+    ret
+
+
+; Font data is NOT embedded here. Both fonts are loaded from disk at cold_boot
+; into bank 7: font51.bin → 0x4000, font32.bin → 0x4800.
+; font_ptr above tracks the active font; scr_set_cols updates it.

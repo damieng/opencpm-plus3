@@ -17,7 +17,7 @@ All code is original Z80 assembly — the BIOS, BDOS, CCP, drivers, and tools ar
 - **MiniCCP** with built-in DIR, TYPE, VER, HELP, DUMP commands and `.COM` loading
 - **Z80 linter** (`z80lint.py`) that validates stack balance and register clobbering across all return paths
 - **ZPA preprocessor** for source-level abstractions on top of Z80 assembly
-- **RTC clock** although stalls during disk-IO like Mallard version
+- **RTC clock** although stalls during disk-IO like Locomotive version
 
 ### Compatibility
 

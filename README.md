@@ -1,4 +1,4 @@
-# OpenCPM+3
+# OpenCP/M +3
 
 Clean-room CP/M 3.1 implementation for the ZX Spectrum +3.
 

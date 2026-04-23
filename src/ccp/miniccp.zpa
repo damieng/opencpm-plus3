@@ -72,11 +72,17 @@ ccp_start:
     ld c, F_COUT
     call BDOS
 
+    ; If A:$$$.SUB is active, pull the next line from it (and echo it).
+    ; Otherwise read from the console.
+    call try_sub
+    jr nc, .got_line
+
     ; Read command line
     ld de, cmd_buf
     ld c, F_RDBUF
     call BDOS
 
+.got_line:
     ; Parse and execute
     call parse_cmd
     jr .prompt
@@ -920,6 +926,165 @@ to_upper:
 
 
 ; ==========================================================================
+; try_sub — If A:$$$.SUB is active, load the next line into cmd_buf and echo
+;   it; otherwise leave cmd_buf untouched.
+;
+;   $$$.SUB record layout (128 bytes):
+;     byte 0  : length L, or 0xFF if the record has been consumed
+;     1..L    : command text (no terminator; L <= 126)
+;
+;   Records are consumed from the highest index downwards — SUBMIT writes the
+;   commands in reverse execution order so the *last* record is the *first*
+;   line to run. Consuming a record is just overwriting byte 0 with 0xFF; we
+;   never rewrite or rename the file. Once every record is consumed (or on any
+;   error) the file is deleted.
+;
+;   Out: carry clear if cmd_buf was filled from SUB (skip F10 read)
+;        carry set if no SUB line is available (caller should F10)
+;   Clobbers: AF, BC, DE, HL
+; @proc try_sub
+; @out   carry
+; @clobbers af,bc,de,hl
+; @end
+try_sub:
+    ld hl, sub_fcb_init
+    ld de, sub_fcb
+    ld bc, 36
+    ldir
+
+    ld de, sub_fcb
+    ld c, 15                   ; F15: Open File
+    call BDOS
+    cp 0xFF
+    jr nz, .opened
+    scf                        ; No $$$.SUB on A:
+    ret
+
+.opened:
+    ld de, sub_fcb
+    ld c, 35                   ; F35: Compute File Size → R0/R1/R2
+    call BDOS
+
+    ld a, (sub_fcb + 35)
+    or a
+    jp nz, .abort              ; > 16M records: bogus, nuke it
+    ld a, (sub_fcb + 34)
+    ld h, a
+    ld a, (sub_fcb + 33)
+    ld l, a
+    or h
+    jp z, .all_done            ; Zero-length file
+
+    dec hl                     ; HL = index of last record
+
+.scan:
+    ld a, l
+    ld (sub_fcb + 33), a
+    ld a, h
+    ld (sub_fcb + 34), a
+    xor a
+    ld (sub_fcb + 35), a
+
+    push hl
+    ld de, sub_dma
+    ld c, 26                   ; F26: Set DMA
+    call BDOS
+
+    ld de, sub_fcb
+    ld c, 33                   ; F33: Read Random
+    call BDOS
+    or a
+    pop hl
+    jp nz, .abort              ; read error
+
+    ld a, (sub_dma)
+    cp 0xFF
+    jr nz, .found
+
+    ld a, h
+    or l
+    jp z, .all_done            ; record 0 was already consumed — done
+    dec hl
+    jr .scan
+
+.found:
+    ; A = length byte, HL = record index (random record still set in FCB)
+    cp 127
+    jp nc, .abort              ; garbage length
+
+    ld (cmd_buf + 1), a
+    or a
+    jr z, .copied              ; empty line
+    ld c, a
+    ld b, 0
+    push hl
+    ld hl, sub_dma + 1
+    ld de, cmd_buf + 2
+    ldir
+    pop hl
+.copied:
+    ; Mark this record consumed (byte 0 = 0xFF), write back to same record.
+    ld a, 0xFF
+    ld (sub_dma), a
+    ld de, sub_fcb
+    ld c, 34                   ; F34: Write Random
+    call BDOS
+
+    ld de, sub_fcb
+    ld c, 16                   ; F16: Close File
+    call BDOS
+
+    call echo_sub_line
+    xor a                      ; CF=0 → cmd_buf is loaded
+    ret
+
+.all_done:
+.abort:
+    ld de, sub_fcb
+    ld c, 16                   ; F16: Close (harmless if never fully opened)
+    call BDOS
+    ld de, sub_fcb
+    ld c, 19                   ; F19: Delete File
+    call BDOS
+    scf
+    ret
+
+
+; ==========================================================================
+; echo_sub_line — Print cmd_buf text + CRLF so a SUB line is visible after
+;   the prompt the same way a typed command would be.
+;   Clobbers: AF, BC, DE, HL
+; ==========================================================================
+; @proc echo_sub_line
+; @clobbers af,bc,de,hl
+; @end
+echo_sub_line:
+    ld a, (cmd_buf + 1)
+    or a
+    jr z, .crlf
+    ld b, a
+    ld hl, cmd_buf + 2
+.loop:
+    ld a, (hl)
+    push hl
+    push bc
+    ld e, a
+    ld c, F_COUT
+    call BDOS
+    pop bc
+    pop hl
+    inc hl
+    djnz .loop
+.crlf:
+    ld e, 0x0D
+    ld c, F_COUT
+    call BDOS
+    ld e, 0x0A
+    ld c, F_COUT
+    jp BDOS
+
+
+; ==========================================================================
 ; Data
 ; ==========================================================================
 
@@ -1300,6 +1465,21 @@ screen_biospb:
 ; FCB for DIR command
 dir_fcb:
     ds 36
+
+; FCB template for A:$$$.SUB — copied into sub_fcb at each prompt
+sub_fcb_init:
+    db 1                       ; drive 1 = A: (we only look on A:)
+    db "$$$     "              ; name, space-padded to 8
+    db "SUB"                   ; ext
+    ds 24                      ; EX, S1, S2, RC, alloc map, CR, R0..R2 = 0
+
+sub_fcb:
+    ds 36
+
+; DMA buffer for $$$.SUB record I/O. Lives outside 0x0080 so parse_cmd's
+; command-tail setup doesn't race with an in-flight read.
+sub_dma:
+    ds 128
 
 ; Stack
     ds 64

@@ -740,6 +740,12 @@ parse_cmd:
     inc b
     jr .com_copy_tail
 .com_tail_done:
+    ; Null-terminate so the loaded program's parser stops at end of
+    ; tail rather than reading into whatever the last DMA left at
+    ; 0x0081+length+ (e.g. DIR's F17 search results). Without this,
+    ; RENAME.COM parses "rped.sub\0mno..." after a `dir *.sub`.
+    xor a
+    ld (de), a
     ld a, b
     ld (0x0080), a             ; Store tail length
     jr .com_tail_ready
@@ -747,6 +753,7 @@ parse_cmd:
 .com_no_tail:
     xor a
     ld (0x0080), a             ; Empty tail
+    ld (0x0081), a             ; ...with a null at [0x0081] too
 
 .com_tail_ready:
     ; Copy type_fcb to high TPA where it won't be overwritten by the

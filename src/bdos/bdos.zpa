@@ -107,6 +107,10 @@ cached_off: dw 0               ; Reserved track offset
 cached_dpb: dw 0               ; Pointer to DPB
 cached_alv: dw 0               ; Pointer to ALV
 cached_csv: dw 0               ; Pointer to CSV
+cached_drive: db 0xFF          ; Drive the cached_* above refer to (0xFF = none).
+                               ; select_drive short-circuits when called for the
+                               ; same drive, avoiding a full directory scan per
+                               ; F20/F21/F33/F40 record. F13 invalidates it.
 
 
 ; ==========================================================================
@@ -595,6 +599,10 @@ bf_f13:
     ld (ro_vec), hl
     ld hl, 0x0080
     ld (bdos_dma), hl
+    ; Invalidate the drive cache so the select_drive below actually does
+    ; the sel_disk + DPB refetch + ALV rebuild (disc may have changed).
+    ld a, 0xFF
+    ld (cached_drive), a
     ; Re-login drive A: caches DPH/DPB/ALV pointers and rebuilds ALV
     xor a
     call select_drive
@@ -945,9 +953,20 @@ bf_f37:
 ; BDOS file functions that hold IX = fcb_buf don't have to.
 ; ==========================================================================
 select_drive:
-    push ix                    ; fdc_login (via BIOS) clobbers IX
+    ; Fast path: same drive as last successful select — cached_* still apply,
+    ; and ALV is up to date (F13 invalidates cached_drive on Reset). Skip
+    ; sel_disk / DPB refetch / build_alv entirely.
     ld c, a                    ; C = drive — preserved across BIOS calls
+    ld a, (cached_drive)
+    cp c
+    ret z
+    ld a, c
+    push ix                    ; fdc_login (via BIOS) clobbers IX
     call .select_body
+    jr c, .sd_err              ; invalid drive — leave cached_drive alone
+    ld a, c
+    ld (cached_drive), a       ; mark this drive as the currently cached one
+.sd_err:
     pop ix
     ret
 
@@ -965,12 +984,14 @@ select_drive:
     jp z, .do_login
     ld e, 1                    ; Already logged in
 .do_login:
-    push de                    ; Save login flag
+    push bc                    ; save drive in C — sel_disk clobbers BC on first-login
+    push de                    ; save login flag
     call sel_disk              ; In: C = drive. Out: HL = DPH (0 = error).
     pop de
+    pop bc
     ld a, h
     or l
-    ret z                      ; Invalid drive
+    jp z, .sb_err              ; Invalid drive — return CF=1
 
     ; On first login of this drive, probe the disc format so the XDPB
     ; reflects what's actually inserted (Freeze=FF makes re-login a no-op).
@@ -1011,7 +1032,7 @@ select_drive:
     call sel_disk
     ld a, h
     or l
-    ret z
+    jr z, .sb_err
 
     ; DPH layout: XLT(2), scratch(6), DIRBUF(2), DPB(2), CSV(2), ALV(2)
     push hl
@@ -1072,12 +1093,16 @@ select_drive:
     ld d, (hl)
     ld (cached_off), de        ; OFF
 
-    ; Build allocation vector from directory if first login
-    ld a, e
-    or a                       ; Was E=0 on entry (first login)?
-    ; Actually we lost that info. For now, always rebuild ALV on login.
+    ; Build allocation vector from directory on this (first) login. select_drive's
+    ; short-circuit means we only reach here when this drive isn't already cached,
+    ; so doing build_alv here is correct and not hot-pathed.
     call build_alv
 
+    xor a                      ; CF=0 → success (also A=0)
+    ret
+
+.sb_err:
+    scf                        ; CF=1 → invalid drive
     ret
 
 

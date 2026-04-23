@@ -223,16 +223,12 @@ parse_cmd:
     jr nz, .dir_wildcard_drv
     jr .dir_no_arg
 .dir_got_fcb:
-    ; Copy type_fcb to dir_fcb
+    ; Copy type_fcb to dir_fcb. parse_filename has already stamped the
+    ; drive byte into type_fcb[0] (0 = default, 1=A:, 2=B:, ...).
     ld hl, type_fcb
     ld de, dir_fcb
     ld bc, 36
     ldir
-    ; Override drive if "X:" was detected
-    ld a, c
-    or a
-    jr z, .dir_check_ext
-    ld (dir_fcb), a
 .dir_check_ext:
     ; If ext is spaces (no explicit ext given), fill with '?' so
     ; DIR FOO matches FOO.* (standard CP/M behavior)
@@ -256,16 +252,24 @@ parse_cmd:
     ld (hl), '?'
     jr .dir_search
 .dir_wildcard_drv:
-    ld hl, dir_fcb
-    ld (hl), a
-    inc hl
-    ld b, 11
-    ld a, '?'
-    jr .fill_q
+    ; A = drive number (1=A:, 2=B:, ...); fall through with drive saved
+    ld b, a
+    jr .wild_common
 .dir_no_arg:
+    ld b, 0                    ; default drive
+.wild_common:
+    ; Zero the whole FCB so stale EX/S1/S2/RC/AL/CR from a previous DIR
+    ; can't bias Search First.
+    push bc
     ld hl, dir_fcb
+    ld de, dir_fcb + 1
     ld (hl), 0
-    inc hl
+    ld bc, 35
+    ldir
+    pop bc
+    ld a, b
+    ld (dir_fcb), a            ; drive byte (0 = default)
+    ld hl, dir_fcb + 1
     ld b, 11
     ld a, '?'
 .fill_q:
@@ -816,10 +820,15 @@ parse_cmd:
     add hl, de
     jr .stub_loop
 .stub_done:
-    ; Reset DMA, then jump to loaded program
+    ; Reset DMA, then jump to loaded program.
+    ; Per CP/M convention, the transient program is entered with
+    ; C = currently selected drive so utilities like STAT can recover it.
     ld de, 0x0080
     ld c, 26
     call 0x0005
+    ld c, 25                   ; F25: Return Current Disk
+    call 0x0005
+    ld c, a                    ; C = current drive (0=A:, 1=B:, ...)
     jp 0x0100
 .stub_src_end:
 
@@ -913,8 +922,6 @@ to_upper:
 ; ==========================================================================
 ; Data
 ; ==========================================================================
-
-cold_flag: db 0                ; Set to 1 after first prompt
 
 ; Command buffer for BDOS F10
 cmd_buf:

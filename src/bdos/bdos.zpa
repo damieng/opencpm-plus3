@@ -547,12 +547,10 @@ bf_f10:
     ex de, hl                  ; DE = &buffer[1] in TPA
     ld a, c
     call write_user_byte(a, de) preserving %func ; Write char count to TPA
-    push bc                    ; lint: ignore — BC is garbage but never used after pop
     ld c, 0x0D
     call con_out
     ld c, 0x0A
     call con_out
-    pop bc
     jp bdos_ret
 
 ; @proc bf_f11
@@ -1506,10 +1504,8 @@ bf_f17:
 .has_drive:
     dec a                      ; Back to 0-based
     ld (search_drv), a
-    push af
     ld (cur_disk), a           ; Temp select this drive
     call select_drive
-    pop af
 
     jp search_next_entry
 
@@ -2057,138 +2053,83 @@ bf_f20:
 ;   If found, copy allocation map to FCB, reset CR, continue reading.
 ; ------------------------------------------------------------------
 .next_extent:
-    ; Increment extent number
-    ld a, (ix + 12)            ; EX (extent low)
+    ; Increment extent number, reset CR
+    ld a, (ix + 12)            ; EX
     inc a
     ld (ix + 12), a
-
-    ; Reset CR to 0
     ld (ix + 32), 0
 
-    ; Search directory for this extent
-    ; We need to find an entry with same name AND matching EX
-    pop ix                     ; Balance the push ix from entry
-    push ix
-
-    ; Save search state
+    ; Search directory for an entry with same user, name, and matching EX.
+    ; IX still holds fcb_buf across the whole search (it is preserved on
+    ; the stack by the push ix at .do_read's entry, which we reuse).
     ld hl, 0
     ld (search_pos), hl
 
-    push ix
-    pop de                     ; DE = FCB
-    ld (search_fcb), de
-
 .next_ext_search:
     ld de, (search_pos)
-    push de
-    call read_dir_entry
-    pop de
-    jp c, .eof                 ; Past end → real EOF
+    call read_dir_entry        ; HL = entry, carry = past end
+    jp c, .eof
 
-    ; Check if entry matches: same user, same name, same EX
-    push de
-    push hl                    ; HL = directory entry
-    ; Compare user (byte 0)
-    ld a, (cur_user)
-    ld c, a
+    ; Filter: user byte 0xE5 (deleted) or != cur_user
     ld a, (hl)
     cp 0xE5
-    jp z, .next_ext_skip
-    cp c
-    jp nz, .next_ext_skip
+    jr z, .next_ext_skip
+    ld b, a
+    ld a, (cur_user)
+    cp b
+    jr nz, .next_ext_skip
 
-    ; Compare name bytes 1-11
-    push hl
+    ; Compare name+ext bytes (entry[1..11] vs fcb[1..11])
+    push hl                    ; save entry_ptr
+    inc hl                     ; HL = &entry[1]
     push ix
-    pop de                     ; DE = FCB
-    inc hl
-    inc de
+    pop de
+    inc de                     ; DE = &fcb[1]
     ld b, 11
 .next_ext_cmp:
     ld a, (de)
     ld c, a
     ld a, (hl)
-    and 0x7F
+    and 0x7F                   ; strip attribute bit
     cp c
-    jp nz, .next_ext_cmp_fail
+    jr nz, .next_ext_name_fail
     inc hl
     inc de
     djnz .next_ext_cmp
-    pop hl                     ; Clean push hl
 
-    ; Name matches — check extent number
-    push hl
-    ld de, 12
-    add hl, de                 ; HL = &entry[12] (EX)
+    ; HL now points at entry[12] (EX). Compare to our EX.
     ld a, (hl)
-    ld b, a                    ; B = entry EX
-    ld a, (ix + 12)            ; A = target EX
+    ld b, a
+    ld a, (ix + 12)
     cp b
-    pop hl
-    jp nz, .next_ext_skip
+    jr nz, .next_ext_name_fail
 
-    ; Found the right extent! Copy allocation data to FCB
-    pop hl                     ; HL = directory entry
-    pop de                     ; DE = search pos
-    push ix
-    pop de                     ; DE = FCB
-    ; Copy bytes 12-31 from directory entry to FCB
-    push hl
-    ld bc, 12
-    add hl, bc                 ; HL = &entry[12]
-    push de
-    pop iy
-    ld de, 12
-    push iy
-    pop bc                     ; BC = FCB base? No...
-    ; Simpler: just copy fields manually
-    pop hl                     ; HL = directory entry start
-    push de                    ; Save FCB ptr
-    ; Copy RC (byte 15)
-    ld a, (ix + 12)            ; Keep our EX
-    push af
-    ld de, 15
-    add hl, de
-    ld a, (hl)                 ; Directory entry RC
-    pop bc                     ; B = our EX
-    pop de                     ; DE = FCB
-    push de
-    push hl
-    ld hl, 15
-    add hl, de                 ; HL = &FCB[15]
-    ld (hl), a                 ; FCB.RC = entry.RC
-    pop hl
-    pop de
-    ; Copy allocation map (bytes 16-31)
-    push de
-    push hl
-    ld hl, 16 - 15             ; Offset from current HL position
-    pop bc                     ; BC = old HL (entry+15)
-    push bc
-    pop hl
-    inc hl                     ; HL = &entry[16]
-    ld de, (search_fcb)
-    push de
-    pop iy
-    ld b, 16
-.copy_alloc:
+    ; Match. HL = &entry[12]. Advance to entry[15] (RC), copy to fcb.RC,
+    ; then copy entry[16..31] (allocation map) to fcb[16..31].
+    ld de, 3
+    add hl, de                 ; HL = &entry[15]
     ld a, (hl)
-    ld (iy + 16), a
-    inc hl
-    inc iy
-    djnz .copy_alloc
-    pop de
+    ld (ix + 15), a            ; FCB.RC = entry.RC
+    inc hl                     ; HL = &entry[16]
 
-    ; Now retry the read with the new extent data
-    pop ix                     ; IX = FCB
     push ix
+    pop de
+    ld a, e
+    add a, 16
+    ld e, a
+    jr nc, .next_ext_nc
+    inc d
+.next_ext_nc:                  ; DE = &fcb[16]
+    ld bc, 16
+    ldir                       ; Copy allocation map
+
+    pop hl                     ; discard saved entry_ptr
     jp .do_read
 
-.next_ext_cmp_fail:
-    pop hl                     ; Clean push hl from name compare
+.next_ext_name_fail:
+    pop hl                     ; discard saved entry_ptr
 .next_ext_skip:
-    pop hl
-    pop de
+    ld de, (search_pos)
     inc de
     ld (search_pos), de
     jp .next_ext_search
@@ -2611,16 +2552,17 @@ bf_f23:
     pop hl                     ; HL = entry base
 
     ; Match — copy new name (FCB bytes 17-27) to entry bytes 1-11
-    push hl
+    push hl                    ; save entry base
     inc hl                     ; HL = &entry[1]
+    push hl                    ; save &entry[1] for DE (LDIR destination)
     push ix
-    pop de
+    pop hl
     ld bc, 17
-    add de, bc                 ; DE = &FCB[17] (new name)
-    ex de, hl                  ; HL = &FCB[17], DE = &entry[1]
+    add hl, bc                 ; HL = &FCB[17] (LDIR source)
+    pop de                     ; DE = &entry[1]
     ld bc, 11
     ldir
-    pop hl
+    pop hl                     ; HL = entry base
     call write_dir_entry
 
     pop hl                     ; balance push hl from .ren_scan
@@ -2787,10 +2729,13 @@ bf_f33:
     ld (ix + 15), a            ; FCB.RC = entry.RC
     inc hl                     ; HL = &entry[16]
     ; Copy 16 bytes from entry[16-31] to FCB[16-31]
+    push hl                    ; save &entry[16] for LDIR source
     push ix
-    pop de
+    pop hl
     ld bc, 16
-    add de, bc                 ; DE = &FCB[16]
+    add hl, bc                 ; HL = &FCB[16]
+    ex de, hl                  ; DE = &FCB[16] (LDIR destination)
+    pop hl                     ; HL = &entry[16]
     ld bc, 16
     ldir
     pop hl
@@ -3038,15 +2983,17 @@ bf_f35:
     ld b, 0
     add hl, bc                 ; HL = EX * 128 + RC
 
-    ; Compare with current max in FCB[33-34]
+    ; Compare with current max in FCB[33-34]. Use SBC HL, DE as a
+    ; destructive compare, then ADD HL, DE to restore HL. The carry out
+    ; of the ADD mirrors the SBC borrow, so JR C means HL < DE.
+    ; Equal is harmless (falls through and re-stores the same value).
     ld e, (ix + 33)
     ld d, (ix + 34)            ; DE = current max
     or a
     sbc hl, de
-    add hl, de                 ; restore HL (sbc was destructive comparison)
+    add hl, de                 ; restore HL
     jp c, .fsz_skip            ; HL < DE, keep current max
-    jp z, .fsz_skip            ; equal, keep
-    ; HL > DE, update
+    ; HL >= DE, update
     ld (ix + 33), l
     ld (ix + 34), h
 
@@ -3240,8 +3187,20 @@ bf_f45:
 ; @clobbers af,bc,de,hl,ix
 ; @end
 bf_f46:
-    pop de
+    pop de                     ; E = drive (0xFF = default)
     pop bc
+    ; If E != 0xFF, temporarily switch cur_disk so cached_alv/dsm/bsh
+    ; reflect the requested drive. bdos_ret restores cur_disk from
+    ; saved_disk, but not the cached_* pointers, so we re-select the
+    ; user's default at the end (see .f46_exit).
+    ld a, e
+    cp 0xFF
+    jr z, .f46_begin
+    cp 16
+    jr nc, .f46_begin          ; Invalid drive — fall back to current
+    ld (cur_disk), a
+    call select_drive
+.f46_begin:
     ; Count free blocks in ALV (blocks 0..DSM)
     ; ALV is a packed bit array: byte N, bit 7 = block N*8, bit 0 = block N*8+7
     ld hl, (cached_alv)
@@ -3332,6 +3291,13 @@ bf_f46:
     pop bc                     ; Restore C = high
     ld a, c                    ; Byte 2 = high
     call write_user_byte(a, de) preserving %func
+.f46_exit:
+    ; Restore cached_* for the user's default drive. cur_disk is restored
+    ; by bdos_ret, but subsequent calls that don't re-select (F20, F21)
+    ; would otherwise hit the wrong drive's DPB/ALV.
+    ld a, (saved_disk)
+    ld (cur_disk), a
+    call select_drive
     xor a
     ld l, a
     ld h, a

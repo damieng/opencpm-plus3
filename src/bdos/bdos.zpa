@@ -933,6 +933,10 @@ bf_f37:
     and h
     ld h, a
     ld (login_vec), hl
+    ; Invalidate cached_drive so select_drive won't short-circuit on
+    ; a drive whose login bits we just cleared (mirrors F13 logic).
+    ld a, 0xFF
+    ld (cached_drive), a
     jp bdos_ret
 
 

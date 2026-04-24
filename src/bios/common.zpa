@@ -116,7 +116,7 @@ bios_visible:
     jp bv_tramp + 3*(29 - 2)       ; 29: XMOVE
     jp userf_stub                  ; 30: USERF (XBIOS dispatch)
     jp 0                           ; 31: reserved
-    jp 0                           ; 32: reserved
+    jp bv_tramp + 3*(32 - 2)       ; 32: SCRMODE
 
 ; Trampoline block: one `call bv_shim` per BIOS fn 2..29. Slot fn=27 is
 ; dead space (fn 27 is dispatched direct to bank_sel above), kept so that

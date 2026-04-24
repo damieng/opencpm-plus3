@@ -3587,10 +3587,20 @@ bf_f50:
     call read_user_byte(de) preserving %func        ; PB[7] = H
     ld (_f50_h), a
 
-    ; Compute BIOS table target: func * 3
+    ; Map the public BIOS function number to a callable target.
+    ; F50 is a TPA-facing BDOS service, so it follows the visible BIOS ABI:
+    ;   - fn 30 (USERF) is rejected: the F50 parameter block has only
+    ;     registers, but USERF requires an inline DW after CALL.
+    ;   - fn 31 is reserved.
+    ;   - fn 32 is SCRMODE via the bank-4 BIOS table.
+    ;   - all other callable functions dispatch to the matching bank-4 slot.
     ld a, (_f50_func)
     cp 33
     jr nc, .f50_bad
+    cp 30
+    jr z, .f50_bad
+    cp 31
+    jr z, .f50_bad
     ld l, a
     ld h, 0
     ld d, h
@@ -3599,7 +3609,7 @@ bf_f50:
     add hl, de                     ; HL = func * 3
     ld (_f50_target), hl
 
-    ; Set up registers from PB and call BIOS function via RET trick.
+    ; Set up registers from PB and call the resolved target via RET trick.
     ; Push return address so the BIOS function RETs back to us.
     ld a, (_f50_a)
     ld bc, (_f50_bc)

@@ -302,6 +302,7 @@ Programs should close any open files before exiting (BDOS F16).
 - **PB format**: `[func, A, C, B, E, D, L, H]` (8 bytes)
 - **Out**: A, HL = BIOS return values
 - **Note**: Calls BIOS function number `func` with specified registers.
+- **Note**: F50 follows the public BIOS numbering. Function 30 (`USERF`) is not supported through F50 because `USERF` requires an inline `DW` after `CALL`, which the 8-byte F50 parameter block cannot express.
 
 #### F98 — Rebuild Allocation Vector (non-standard)
 - **Out**: A=0

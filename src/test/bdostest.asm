@@ -1,4 +1,4 @@
-; BDOSTEST.COM — BDOS function tester, F1..F35
+; BDOSTEST.COM — BDOS function tester, F1..F35 plus F104/F105
 ;
 ; For each function, prints: "Fnn FNAME  : result"
 ; Non-blocking calls are executed and return value shown.
@@ -54,6 +54,7 @@ start:
     call tst_f33        ; F33 RDRAND   — read random
     call tst_f34        ; F34 WRRAND   — write random
     call tst_f35        ; F35 FILSIZ   — compute file size
+    call tst_f104       ; F104 SETDATE — set date/time + F105 round-trip
 
     ld de, msg_done
     ld c, 9
@@ -1606,6 +1607,70 @@ tst_f35:
     jp print_crlf
 
 ; ============================================================
+; F104/F105: Set/Get Date and Time
+;   Round-trip: load DAT buffer with known values, call F104,
+;   then F105 into a separate buffer, compare all 4 fields.
+;   Regression guard for the F104 minute-pointer bug where DE
+;   got clobbered by the hour*60 computation and scb_minute
+;   was written from a byte at (hour*4) in the TPA.
+; ============================================================
+tst_f104:
+    ld de, lbl_f104
+    call print_label
+
+    ; Input: days=0x1234 (Sat 1998-06-13), hour=0x14 (BCD), min=0x37 (BCD)
+    ld hl, dat_in
+    ld (hl), 0x34          ; days_lo
+    inc hl
+    ld (hl), 0x12          ; days_hi
+    inc hl
+    ld (hl), 0x14          ; BCD hour (20 decimal — hour*4=0x50 is the buggy read addr)
+    inc hl
+    ld (hl), 0x37          ; BCD min
+
+    ld de, dat_in
+    ld c, 104              ; F104 Set Date/Time
+    call BDOS
+
+    ; Zero the output buffer first so stale bytes can't fake a pass
+    ld hl, dat_out
+    ld b, 5
+.f104_zero:
+    ld (hl), 0
+    inc hl
+    djnz .f104_zero
+
+    ld de, dat_out
+    ld c, 26               ; F26 Set DMA
+    call BDOS
+
+    ld c, 105              ; F105 Get Date/Time
+    call BDOS
+
+    ld a, (dat_out)
+    cp 0x34
+    jp nz, .f104_fail
+    ld a, (dat_out+1)
+    cp 0x12
+    jp nz, .f104_fail
+    ld a, (dat_out+2)
+    cp 0x14
+    jp nz, .f104_fail
+    ld a, (dat_out+3)
+    cp 0x37
+    jp nz, .f104_fail
+
+    ld de, msg_pass_short
+    ld c, 9
+    call BDOS
+    jp print_crlf
+.f104_fail:
+    ld de, msg_fail_short
+    ld c, 9
+    call BDOS
+    jp print_crlf
+
+; ============================================================
 ; Helpers
 ; ============================================================
 
@@ -1664,7 +1729,7 @@ print_hex_a:
 
 msg_header:
     DB 0Dh, 0Ah
-    DB "BDOS Tester F01..F35", 0Dh, 0Ah
+    DB "BDOS Tester F01..F35, F104", 0Dh, 0Ah
     DB "--------------------", 0Dh, 0Ah
     DB '$'
 
@@ -1703,6 +1768,7 @@ lbl_f32:    DB "F32 USRCOD   : $"
 lbl_f33:    DB "F33 RDRAND   : $"
 lbl_f34:    DB "F34 WRRAND   : $"
 lbl_f35:    DB "F35 FILSIZ   : $"
+lbl_f104:   DB "F104 SETDATE: $"
 
 f09_test_str:   DB "TEST$"
 
@@ -1724,6 +1790,8 @@ fn_temp2:   DB "TEMP2   $$$"
 fcb_wild:   DB 0, "???????????", 0
 
 dma_test_buf: DS 128           ; Safe DMA target for F26 test
+dat_in:       DS 4             ; 4-byte DAT input to F104
+dat_out:      DS 5             ; 5-byte DAT output from F105 (includes sec)
 
 msg_done:
     DB 0Dh, 0Ah

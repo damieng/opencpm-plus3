@@ -3777,7 +3777,8 @@ bf_f104:
     call read_user_byte(de) preserving %func    ; A = BCD hour
     call bcd_to_bin                              ; A = binary hour
     pop de
-    inc de
+    inc de                         ; DE = minute pointer
+    push de                        ; preserve across the hour*60 math
     ld l, a
     ld h, 0                        ; HL = hour
     add hl, hl
@@ -3790,6 +3791,7 @@ bf_f104:
     pop de                         ; DE = hour * 4
     or a
     sbc hl, de                     ; HL = hour * 60
+    pop de                         ; DE = minute pointer (restored)
     push hl                        ; save hour * 60
     ; Read BCD min → binary, add to hour*60
     call read_user_byte(de) preserving %func    ; A = BCD min

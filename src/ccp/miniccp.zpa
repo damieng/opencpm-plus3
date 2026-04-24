@@ -26,6 +26,9 @@ F_RDBUF equ 10                 ; Read console buffer (DE = buf addr)
 F_CSTAT equ 11                 ; Console status
 F_SCB   equ 49                 ; Get/Set SCB byte (DE→[offset,op]; op=0=get)
 F_BIOS  equ 50                 ; Direct BIOS call (DE→8-byte BIOSPB)
+F_CONMODE equ 109              ; Get/Set console mode word (F109)
+
+CON_MODE_DISPLAY equ 0x02      ; con_mode bit 1: echo SUBmit lines
 
 ; ==========================================================================
 ; CCP Entry Point
@@ -1041,7 +1044,12 @@ try_sub:
     ld c, 16                   ; F16: Close File
     call BDOS
 
-    call echo_sub_line
+    ld de, 0xFFFF
+    ld c, F_CONMODE
+    call BDOS                  ; HL = con_mode
+    ld a, l
+    and CON_MODE_DISPLAY
+    call nz, echo_sub_line     ; DISPLAY on → echo the SUB line
     xor a                      ; CF=0 → cmd_buf is loaded
     ret
 

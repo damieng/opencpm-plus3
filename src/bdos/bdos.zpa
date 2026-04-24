@@ -87,7 +87,10 @@ login_vec:  dw 0               ; Login vector (bit N = drive N logged in)
 ro_vec:     dw 0               ; Read-only vector
 error_mode: db 0               ; F45: BDOS error mode
 return_code: dw 0              ; F108: program return code
-con_mode:   dw 0               ; F109: console mode word
+con_mode:   dw 0x0003          ; F109: console mode word (default: PAGE + DISPLAY on)
+                               ; bit 0 = PAGE    (SETDEF [PAGE]/[NOPAGE])
+                               ; bit 1 = DISPLAY (SETDEF [DISPLAY]/[NO DISPLAY])
+bdos_page_row: db 0            ; LFs output since last pause/input
 out_delim:  db '$'             ; F110: output delimiter (default '$')
 ; Date/time fields are in the SCB (common.asm): scb_date, scb_minute, scb_sec
 
@@ -286,6 +289,75 @@ bdos_ret:
 
 
 ; ==========================================================================
+; Paging support — honors con_mode bit 0 (PAGE). Only BDOS-routed output
+; paginates; direct BIOS/XBIOS output bypasses this wrapper.
+; ==========================================================================
+
+CON_MODE_PAGE    equ 0x01
+CON_MODE_DISPLAY equ 0x02
+
+; bdos_con_out — BIOS con_out with optional page-break pause
+;   In: C = char
+;   Clobbers: AF, BC, DE, HL, IX
+; @proc bdos_con_out
+; @param %char:u8 c
+; @clobbers af,bc,de,hl,ix
+; @end
+bdos_con_out:
+    ld a, c
+    cp 0x0A
+    jp nz, con_out             ; only LFs drive the page counter
+    ld a, (con_mode)
+    and CON_MODE_PAGE
+    jp z, .tick                ; paging disabled → just count and emit
+    ld a, (bdos_page_row)
+    ld hl, scb_conpage
+    cp (hl)                    ; A < conpage (page not full)?
+    jr c, .tick
+    call bdos_page_pause       ; page full → pause (resets counter)
+.tick:
+    ld a, (bdos_page_row)
+    inc a
+    ld (bdos_page_row), a
+    ld c, 0x0A
+    jp con_out
+
+; bdos_page_pause — show "-- More --", wait for key, erase, reset counter
+;   Clobbers: AF, BC, DE, HL, IX
+; @proc bdos_page_pause
+; @clobbers af,bc,de,hl,ix
+; @end
+bdos_page_pause:
+    ld hl, bdos_pause_msg
+.msg_loop:
+    ld a, (hl)
+    or a
+    jr z, .wait_key
+    ld c, a
+    push hl
+    call con_out
+    pop hl
+    inc hl
+    jr .msg_loop
+.wait_key:
+    call con_in
+    cp 0x03                    ; Ctrl-C aborts to warm boot
+    jp z, fn_wboot
+    ; Erase prompt: CR, ESC, 'K' (clear to end of line)
+    ld c, 0x0D
+    call con_out
+    ld c, 0x1B
+    call con_out
+    ld c, 'K'
+    call con_out
+    xor a
+    ld (bdos_page_row), a
+    ret
+
+bdos_pause_msg: db '-- More --', 0
+
+
+; ==========================================================================
 ; Console functions (F0-F12)
 ; ==========================================================================
 
@@ -310,6 +382,8 @@ bf_f00:
 bf_f01:
     pop de
     pop bc
+    xor a
+    ld (bdos_page_row), a      ; input resets paging context
     call con_in
     push af                    ; lint: ignore — saving A return value, F is harmless
     ld c, a
@@ -328,7 +402,7 @@ bf_f02:
     pop de
     pop bc
     ld c, e
-    call con_out
+    call bdos_con_out
     jp bdos_ret
 
 ; F3: Auxiliary Input (reader)
@@ -395,9 +469,11 @@ bf_f06:
     cp 0xFE
     jp z, .status
     ld c, e
-    call con_out
+    call bdos_con_out
     jp bdos_ret
 .input:
+    xor a
+    ld (bdos_page_row), a
     call con_status
     or a
     jp z, .none
@@ -456,7 +532,7 @@ bf_f09:
     jp z, bdos_ret
     ld c, a
     push de
-    call con_out
+    call bdos_con_out
     pop de
     inc de
     jp .ploop
@@ -470,6 +546,8 @@ bf_f09:
 bf_f10:
     pop de
     pop bc
+    xor a
+    ld (bdos_page_row), a
     ld (rdbuf_ptr), de
     call read_user_byte(de) preserving %func    ; A = max chars from buffer[0] in TPA (DE = buf addr)
     ld b, a
@@ -4156,7 +4234,7 @@ bf_f111:
     ld e, c                    ; DE = current TPA address
     call read_user_byte(de) preserving %func    ; A = char from TPA
     ld c, a
-    call con_out               ; Output character
+    call bdos_con_out          ; Output character (with paging if enabled)
     pop bc
     inc bc                     ; Next TPA address
     pop hl

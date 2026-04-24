@@ -112,6 +112,7 @@ docs/       API reference, filesystem documentation
 
 - [CP/M 3.1 BDOS API Reference](docs/API.md)
 - [Filesystem Layout](docs/filesystem.md)
+- [zx84 MCP Smoke Test](docs/mcp-smoke-test.md)
 
 ## License
 

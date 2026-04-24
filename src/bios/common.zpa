@@ -171,19 +171,22 @@ bdos_stub:
     push bc
     push de
 
-    ; Switch to system banks (mode 3: 4,7,6,3)
+    ; Switch to system banks (mode 3: 4,7,6,3). BDOS runs with
+    ; interrupts enabled once the stack and bank are stable.
     ld a, (motor_flag)
     or BANK1_1FFD
     call write_1ffd
+    ei
 
     ; Restore BDOS parameters
     pop de
     pop bc
 
-    ; Call real BDOS (in bank 4)
+    ; Call real BDOS (in bank 4) — interrupts enabled
     call bdos_entry
 
     ; Save ALL return values across bank switch (A, B, HL)
+    di
     push hl
     push af
     push bc
@@ -218,6 +221,8 @@ motor_countdown: db 0              ; Frames remaining until ISR drops the motor
                                    ; ticks it down; on expiry the ISR clears
                                    ; motor_flag and writes last_1ffd with the
                                    ; motor bit cleared to physically stop it).
+fdc_busy:       db 0               ; Non-zero while FDC code owns the motor/FDC.
+                                   ; The ISR never drops the motor while busy.
 last_1ffd:      db BANK1_1FFD      ; Shadow of 1FFD — maintained by write_1ffd
                                    ; so the ISR can physically drop the motor
                                    ; without having to know the current bank.
@@ -267,8 +272,10 @@ bios_call_bank4:
     ld sp, bdos_stack - 16         ; Use lower part of BDOS stack area
     ld hl, (_bc4_hl)               ; HL = target address
     ; CALL (HL) via push-return trick
+    ei
     call .jp_hl
     ; BIOS function returned — save return values on safe stack
+    di
     ld sp, _bc4_stack              ; Back to trampoline stack for bank switch
     ld (_bc4_hl), hl
     push af
@@ -379,19 +386,20 @@ isr_handler:
     push af
     push hl
 
+    ld a, (fdc_busy)
+    or a
+    jr nz, .motor_tick_done
+
     ; --- Motor-off timeout (modeled on +3DOS l0068) ---
     ; motor_on sets motor_countdown to MOTOR_OFF_DELAY. We decrement it
-    ; each frame; on expiry we clear motor_flag and write last_1ffd with
-    ; the motor bit cleared to physically stop the drive — we can't rely
-    ; on the next bank switch (the CCP's fn 10 blocks in system mode for
-    ; seconds at a time), and the last_1ffd shadow tells us which bank
-    ; value to write without having to know the current mode.
+    ; only while the FDC is idle; on expiry we clear motor_flag and write
+    ; last_1ffd with the motor bit cleared to physically stop the drive.
     ld a, (motor_countdown)
     or a
-    jr z, .mc_done
+    jr z, .motor_tick_done
     dec a
     ld (motor_countdown), a
-    jr nz, .mc_done
+    jr nz, .motor_tick_done
     ; Expired — clear motor_flag and physically drop the motor bit.
     xor a
     ld (motor_flag), a
@@ -402,7 +410,7 @@ isr_handler:
     ld bc, PORT_1FFD
     out (c), a
     pop bc
-.mc_done:
+.motor_tick_done:
 
     ; Increment raw frame counter
     ld hl, (isr_tick)

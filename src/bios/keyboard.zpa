@@ -31,9 +31,11 @@
 ; Keyboard uses same port as ULA: 0xFE (PORT_ULA defined in bios.asm)
 PORT_KBD      equ PORT_ULA
 
-; Repeat counters tick once per _kbd_scan. kbd_getchar gates scans behind
-; `ei; halt; di`, so in the normal blocking path scans happen once per IM 1
-; interrupt = 50Hz = ~20ms per scan.
+; isr_tick is defined in common.zpa (common memory, always visible).
+
+; Matrix scans may run more often than 50Hz for nonblocking BIOS CONST
+; polling. Repeat counters are gated on isr_tick so held keys repeat at
+; frame rate regardless of call rate.
 ;   25 iters ≈ 500ms initial delay
 ;    3 iters ≈  60ms repeat rate (~17 cps)
 REPEAT_DELAY  equ 25
@@ -47,6 +49,8 @@ kbd_key_ready:  db 0           ; 1 = key in buffer
 kbd_key_buf:    db 0           ; Buffered ASCII code
 kbd_mods:       db 0           ; Saved modifier state for repeat
 kbd_settle:     db 0           ; Debounce: 1 = waiting for settle scan
+kbd_last_tick:  dw 0           ; isr_tick value at last real scan
+kbd_tick_changed: db 0         ; 1 = this scan is on a new ISR tick
 
 ; Inject buffer — write text here, set kbd_inject_len, reset kbd_inject_rd.
 ; kbd_getchar drains this before polling the real keyboard.
@@ -73,6 +77,7 @@ kbd_init:
     ld (kbd_key_buf), a
     ld (kbd_mods), a
     ld (kbd_settle), a
+    ld (kbd_tick_changed), a
     ld (kbd_inject_len), a
     ld (kbd_inject_rd), a
     ld hl, REPEAT_DELAY
@@ -144,10 +149,9 @@ kbd_getchar:
     or a
     jr nz, .got_key
 .wait:
-    ei                         ; Allow ISR to tick (time, inject)
-    halt                       ; Wait for next interrupt (~50Hz)
-    di                         ; Back to system mode (interrupts off)
-    call _kbd_scan             ; Clobbers AF, BC, DE, HL
+    ei                         ; Let the system ISR tick while blocking
+    halt                       ; Wait for next frame interrupt
+    call _kbd_scan             ; Tick-gated: only processes once per 50Hz frame
     ld a, (kbd_inject_len)     ; Inject may arrive while waiting
     or a
     jr nz, kbd_getchar         ; Re-enter to drain inject buffer
@@ -177,6 +181,26 @@ kbd_getchar:
 ; @clobbers af,bc,de,hl
 ; @end
 _kbd_scan:
+    ; Track frame changes, but always scan the matrix. BIOS CONST users
+    ; such as BBC BASIC may poll from TPA so briefly that no system-mode
+    ; interrupt lands inside the BIOS call; skipping same-tick scans would
+    ; miss those key edges. Held-key repeat countdown is gated below.
+    xor a
+    ld (kbd_tick_changed), a
+    ld hl, (isr_tick)
+    ld de, (kbd_last_tick)
+    ld a, l
+    cp e
+    jr nz, .tick_changed
+    ld a, h
+    cp d
+    jr z, .scan_matrix
+.tick_changed:
+    ld (kbd_last_tick), hl      ; Record this tick
+    ld a, 1
+    ld (kbd_tick_changed), a
+
+.scan_matrix:
     ld c, PORT_KBD
 
     ; --- Read modifier state ---
@@ -324,6 +348,11 @@ _kbd_scan:
     jr .emit
 
 .same_repeat:
+    ; Same key held: only advance repeat timing once per ISR tick.
+    ld a, (kbd_tick_changed)
+    or a
+    ret z
+
     ; Same key held: decrement 16-bit repeat counter
     ; Do NOT update kbd_mods — keep from initial/settled press.
     push hl

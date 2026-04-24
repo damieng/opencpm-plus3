@@ -202,6 +202,39 @@ fdc_init:
 
 
 ; ==========================================================================
+; FDC interrupt critical-section helpers
+; ==========================================================================
+
+; fdc_enter_critical — Mark the FDC busy and disable interrupts
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF
+; ==========================================================================
+; @proc fdc_enter_critical
+; @clobbers af
+; @end
+fdc_enter_critical:
+    di
+    ld a, 1
+    ld (fdc_busy), a
+    ret
+
+; fdc_leave_critical — Mark the FDC idle and enable interrupts
+;   In:      nothing
+;   Out:     nothing
+;   Clobbers: AF
+; ==========================================================================
+; @proc fdc_leave_critical
+; @clobbers af
+; @end
+fdc_leave_critical:
+    xor a
+    ld (fdc_busy), a
+    ei
+    ret
+
+
+; ==========================================================================
 ; fdc_login — Detect disc format and populate the per-drive XDPB.
 ;
 ; Algorithm:
@@ -227,6 +260,14 @@ fdc_init:
 ; @clobbers af,bc,de,hl,ix
 ; @end
 fdc_login:
+    call fdc_enter_critical
+    call fdc_login_body
+    push af
+    call fdc_leave_critical
+    pop af
+    ret
+
+fdc_login_body:
     call load_drive_xdpb            ; IX = this drive's XDPB
     ld a, (ix + XDPB_FREEZE)
     cp 0xFF
@@ -417,10 +458,14 @@ load_drive_xdpb:
 ; @end
 fdc_read:
     push ix                    ; IX used internally (XDPB), but TPA programs need it preserved
-    call .body
+    call fdc_enter_critical
+    call fdc_read_body
+    push af
+    call fdc_leave_critical
+    pop af
     pop ix
     ret
-.body:
+fdc_read_body:
     call ensure_sector         ; Ensure correct physical sector in buffer
     ret nz                     ; Return error if read failed
 
@@ -456,10 +501,14 @@ fdc_read:
 ; @end
 fdc_write:
     push ix
-    call .body
+    call fdc_enter_critical
+    call fdc_write_body
+    push af
+    call fdc_leave_critical
+    pop af
     pop ix
     ret
-.body:
+fdc_write_body:
     push bc                    ; Save write type
     call ensure_sector         ; Ensure correct physical sector in buffer
     pop bc
@@ -485,7 +534,7 @@ fdc_write:
     ld a, 1
     ld (deblock_dirty), a
 
-    call flush_deblock
+    call flush_deblock_body
     ret
 
 
@@ -533,7 +582,7 @@ ensure_sector:
 .need_read:
     ; Flush any dirty data first
     push bc                    ; Save B = physical sector (flush clobbers BC)
-    call flush_deblock
+    call flush_deblock_body
     pop bc
 
     ; Record what we're buffering
@@ -586,6 +635,14 @@ ensure_sector:
 ; @clobbers af,bc,de,hl,ix
 ; @end
 flush_deblock:
+    call fdc_enter_critical
+    call flush_deblock_body
+    push af
+    call fdc_leave_critical
+    pop af
+    ret
+
+flush_deblock_body:
     ld a, (deblock_dirty)
     or a
     ret z                      ; Not dirty, nothing to do

@@ -1,0 +1,9 @@
+build/
+*.lst
+*.dsk
+# Ignore generated binaries but not source font
+/build/*.bin
+!src/bios/font51.bin
+references/
+__pycache__/
+*.pyc

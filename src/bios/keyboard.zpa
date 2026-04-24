@@ -439,6 +439,27 @@ _kbd_to_ascii:
     ret
 
 .ctrl:
+    ; Caps+Sym. Real-+3 Extended mode binds ~ | \ { } on A..G (raws 5..9)
+    ; and ] [ on U,Y (raws 28,29); route those through the Sym table so
+    ; CS+SS combos match +3 muscle memory and the emulator's `type` binding
+    ; for brackets. Other CS+SS combos fall through to Ctrl-code generation.
+    ; We lose Ctrl-Y/U and Ctrl letters for the EXT keys, none of which CP/M
+    ; relies on (Ctrl-C comes from Caps+Space, below).
+    ld a, l                    ; A = raw key
+    cp 5
+    jr c, .ctrl_letter         ; raw < 5 (Row 0 Caps/Z/X/C/V) — try Ctrl
+    cp 10
+    jr c, .ctrl_use_sym        ; raws 5..9 (A..G) — EXT symbols
+    cp 28
+    jr c, .ctrl_letter         ; raws 10..27 — not EXT
+    cp 30
+    jr nc, .ctrl_letter        ; raws 30+ (Enter row on) — not EXT
+.ctrl_use_sym:
+    ld de, _key_sym
+    add hl, de
+    ld a, (hl)
+    ret
+.ctrl_letter:
     ; Ctrl = Caps+Sym: get unshifted char, if letter → control code
     ld de, _key_noshift
     add hl, de

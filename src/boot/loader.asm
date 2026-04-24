@@ -49,6 +49,11 @@ SYS_NAME:   db "CPM3    SYS"
     ld a, 6
     out (PORT_ULA), a
 
+    ; Keep the loader stack below the CPM3.SYS load range. A 16K system image
+    ; reads a padded final sector at FE00h, which would overwrite the boot
+    ; sector's FE00h stack before the jump to BIOS.
+    ld sp, BIOS_ADDR
+
     ; Ensure motor on
     ld bc, PORT_1FFD
     ld a, PAGING_M2

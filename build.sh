@@ -61,6 +61,7 @@ echo "  Assembling utilities..."
 sjasmplus --raw=build/date.com build/zpa/date.asm
 sjasmplus --raw=build/showxdpb.com src/tools/showxdpb.asm
 sjasmplus --raw=build/dump.com src/tools/dump.asm
+sjasmplus --raw=build/setdef.com src/tools/setdef.asm
 
 # Stage 2: Build DSK
 echo "  Building DSK..."
@@ -83,7 +84,7 @@ python3 tools/mkdsk.py create build/cpm3.dsk \
     --add build/CPM3.SYS src/bios/font51.bin src/bios/font32.bin \
     build/bdostest.com build/xtetest.com \
     build/disktest.com build/termtest.com \
-    build/date.com build/showxdpb.com build/dump.com \
+    build/date.com build/showxdpb.com build/dump.com build/setdef.com \
     references/binaries/*.COM references/binaries/*.SUB \
     $EXTRAFILES
 

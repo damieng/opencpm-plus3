@@ -1,8 +1,8 @@
 ; DUMP.COM — Hex/ASCII file viewer
-; Usage: DUMP filename.ext [more]
+; Usage: DUMP filename.ext
 ; Displays file contents as hex bytes and ASCII.
 ; Bytes per line adapts to screen width: (width-8)/4
-; With [more], pauses every 23 lines with -- More -- prompt.
+; Paging is handled system-wide by BDOS when SETDEF [PAGE] is on.
 ;
 ; Build: sjasmplus --raw=build/dump.com src/tools/dump.asm
 
@@ -26,9 +26,6 @@ start:
     ld a, (080h)
     or a
     jp z, usage
-    xor a
-    ld (moreflag), a
-    call parse_more_switch
     ld de, 05Ch
     ld c, F_OPEN
     call BDOS
@@ -49,7 +46,6 @@ start:
     call BDOS
 
     xor a
-    ld (lnctr), a
     ld hl, 0
     ld (foff), hl
     ld (brem), a
@@ -142,19 +138,6 @@ asclp:
     ld hl, (foff)
     add hl, de
     ld (foff), hl
-
-    ld hl, lnctr
-    inc (hl)
-    ld a, (hl)
-    cp 23
-    jp c, doline
-    ld a, (moreflag)
-    or a
-    jr z, .no_pause
-    call pause
-.no_pause:
-    xor a
-    ld (lnctr), a
     jp doline
 
 xit:
@@ -174,80 +157,6 @@ nofile:
     ld c, F_PRINT
     call BDOS
     rst 0
-
-
-; parse_more_switch — Set moreflag if raw command tail contains MORE/[MORE]
-;   In:  command tail at 0080h
-;   Out: moreflag = 1 if MORE or [MORE] is present, otherwise unchanged
-;   Clobbers: AF, BC, DE, HL
-parse_more_switch:
-    ld a, (080h)
-    ld c, a
-    ld hl, 081h
-.scan:
-    ld a, c
-    or a
-    ret z
-    push bc
-    push hl
-    call match_more_switch
-    pop hl
-    pop bc
-    ld a, (moreflag)
-    or a
-    ret nz
-    inc hl
-    dec c
-    jr .scan
-
-; match_more_switch — Match MORE or [MORE] at HL with C chars remaining
-;   In:  HL = candidate pointer, C = remaining tail length
-;   Out: moreflag = 1 on match
-;   Clobbers: AF, DE, HL
-match_more_switch:
-    ld a, (hl)
-    cp '['
-    jr z, .bracketed
-    ld a, c
-    cp 4
-    ret c
-    ld de, opt_more_plain
-    jr .loop
-.bracketed:
-    ld a, c
-    cp 6
-    ret c
-    ld de, opt_more_bracketed
-.loop:
-    ld a, (de)
-    or a
-    jr z, .matched
-    push de
-    ld e, a
-    ld a, (hl)
-    call upper
-    cp e
-    pop de
-    ret nz
-    inc hl
-    inc de
-    jr .loop
-.matched:
-    ld a, 1
-    ld (moreflag), a
-    ret
-
-; upper — Convert ASCII lowercase to uppercase
-;   In:  A = character
-;   Out: A = uppercase character if lowercase
-;   Clobbers: F
-upper:
-    cp 'a'
-    ret c
-    cp 'z' + 1
-    ret nc
-    sub 20h
-    ret
 
 
 ; getbyte — read next byte from file across record boundaries
@@ -370,24 +279,6 @@ dot:
     ld a, '.'
     ret
 
-; pause — wait for keypress, erase prompt via ESC K
-;   In:  nothing
-;   Out: nothing
-;   Clobbers: AF, BC, DE, HL
-pause:
-    ld de, msg_pause
-    ld c, F_PRINT
-    call BDOS
-    ld c, F_CONIN
-    call BDOS
-    ld e, 0Dh
-    call cout
-    ld e, 01Bh
-    call cout
-    ld e, 'K'
-    jp cout
-
-
 hextab:
     db '0123456789ABCDEF'
 
@@ -395,19 +286,11 @@ scb_pb:
     db 1Ah, 00h, 00h, 00h
 
 msg_usage:
-    db 'Usage: DUMP filename.ext [more]', 0Dh, 0Ah, '$'
+    db 'Usage: DUMP filename.ext', 0Dh, 0Ah, '$'
 msg_nofile:
     db 'File not found', 0Dh, 0Ah, '$'
-msg_pause:
-    db '-- More --$'
-opt_more_bracketed:
-    db '[MORE]', 0
-opt_more_plain:
-    db 'MORE', 0
 
 bpl:    db 0
-lnctr:  db 0
-moreflag: db 0
 foff:   dw 0
 brem:   db 0
 chnk:   db 0

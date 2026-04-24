@@ -54,6 +54,7 @@ echo   Assembling utilities...
 %SJASMPLUS% --raw=build\date.com build\zpa\date.asm
 %SJASMPLUS% --raw=build\showxdpb.com src\tools\showxdpb.asm
 %SJASMPLUS% --raw=build\dump.com src\tools\dump.asm
+%SJASMPLUS% --raw=build\setdef.com src\tools\setdef.asm
 
 :: Stage 2: Build DSK
 echo   Building DSK...
@@ -62,7 +63,7 @@ copy /y build\bios.bin build\CPM3.SYS >nul
 set REF_BINS=
 for %%F in (references\binaries\*.COM references\binaries\*.SUB) do set REF_BINS=!REF_BINS! %%F
 
-python3 tools\mkdsk.py create build\cpm3.dsk --boot build\bootsect.bin --system build\loader.bin --add build\CPM3.SYS src\bios\font51.bin src\bios\font32.bin build\bdostest.com build\xtetest.com build\disktest.com build\termtest.com build\date.com build\showxdpb.com build\dump.com !REF_BINS! %*
+python3 tools\mkdsk.py create build\cpm3.dsk --boot build\bootsect.bin --system build\loader.bin --add build\CPM3.SYS src\bios\font51.bin src\bios\font32.bin build\bdostest.com build\xtetest.com build\disktest.com build\termtest.com build\date.com build\showxdpb.com build\dump.com build\setdef.com !REF_BINS! %*
 if errorlevel 1 goto :fail
 
 for %%A in (build\loader.bin) do echo   Loader: %%~zA bytes

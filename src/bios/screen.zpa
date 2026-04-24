@@ -61,8 +61,6 @@ BORDER_COL   equ 1             ; Blue
 
 cursor_col: db 0               ; 0-50
 cursor_row: db 0               ; 0-23
-_rnd_shift: db 0               ; Shift amount for current render
-_rnd_bcol:  db 0               ; Byte column for current render
 _rnd_row:   db 0               ; Row for current render (saved here
                                ; because we run out of registers)
 
@@ -820,7 +818,14 @@ _mul_row_scr_cols:
 ;   Clobbers: AF, BC, DE, HL, IX
 ;
 ;   Screen must be paged in before calling.
-;   Uses memory variables _rnd_shift, _rnd_bcol, _rnd_row as temporaries.
+;   Uses memory variable _rnd_row as temporary.
+;
+;   51-col shift dispatch: pixel_x = col*5 gives shift = pixel_x & 7, one
+;   of 8 values. Each .shiftN variant unrolls that many right-shifts and
+;   uses hard-coded mask constants so the inner scan loop only does the
+;   font load, the unrolled shifts, and the screen write. Shifts 0-3 fit
+;   the 5-pixel glyph in one byte (no spill); shifts 4-7 always spill
+;   into the next byte.
 ; ==========================================================================
 ; @proc _render_char
 ; @param %ch:u8  b
@@ -851,90 +856,44 @@ _render_char:
     jr z, .render32
 
     ; --- 51-col path: pixel_x = col * 5, non-byte-aligned ---
-    ; C = column (0-50). Compute pixel_x = C * 5.
     ld a, c
     ld b, a                    ; B = column (temp)
     add a, a                   ; ×2
     add a, a                   ; ×4
     add a, b                   ; ×5 (A = pixel_x, max 250)
-    ld b, a                    ; B = pixel_x
-
+    ld c, a                    ; C = pixel_x (save for shift below)
     srl a
     srl a
     srl a                      ; A = pixel_x >> 3 = byte column
-    ld (_rnd_bcol), a
-
-    ld a, b                    ; A = pixel_x
+    ld b, a                    ; B = byte_col (preserved by _calc_row_addr)
+    ld a, c
     and 0x07                   ; A = pixel_x & 7 = shift amount
-    ld (_rnd_shift), a
+    ld c, a                    ; C = shift (preserved by _calc_row_addr)
 
     ; --- Screen base address for (row, scan 0, byte_col) ---
     ld a, (_rnd_row)
     call _calc_row_addr        ; HL = screen addr for (row, byte_col=0, scan 0)
-    ld a, (_rnd_bcol)
+    ld a, b                    ; A = byte_col
     or l
     ld l, a                    ; HL = screen addr for (row, byte_col, scan 0)
 
-    ; --- Render 8 scan lines (51-col, shift/spill) ---
-    ld b, 8
-.scan:
-    push bc                    ; Save loop counter (B=count)
-    push hl                    ; Save screen address
-
-    ; Get font byte (pixels in bits 7-3)
-    ld d, (ix + 0)
-    inc ix
-    ld e, 0                    ; DE = font byte : 0 (16-bit shifted value)
-
-    ; Create mask for the 5-pixel area
-    ld b, 0xF8                 ; BC = mask high : 0
-    ld c, 0
-
-    ; Shift font (DE) and mask (BC) right by _rnd_shift positions
-    ld a, (_rnd_shift)
+    ; --- Dispatch on shift value (0..7) ---
+    ld a, c
     or a
-    jr z, .apply               ; shift = 0: no shifting needed
-.sloop:
-    srl d
-    rr e                       ; Shift font right through DE
-    srl b
-    rr c                       ; Shift mask right through BC
+    jp z, .shift0
     dec a
-    jr nz, .sloop
-
-.apply:
-    ; D:E = shifted font (high:low byte)
-    ; B:C = shifted mask (high:low byte)
-    ; Stack: screen_addr, loop_counter
-
-    pop hl                     ; HL = screen address
-    push hl                    ; Re-push for later restore
-
-    ; --- First screen byte ---
-    ld a, b                    ; A = mask high byte
-    cpl                        ; Invert: 1 = bits to keep
-    and (hl)                   ; Keep non-character pixels
-    or d                       ; Merge in font pixels
-    ld (hl), a
-
-    ; --- Second screen byte (if character spills across byte boundary) ---
-    ld a, e
-    or c                       ; Any spill bits? (font low OR mask low)
-    jr z, .no_spill
-    inc l                      ; Next byte column
-    ld a, c                    ; A = mask low byte
-    cpl
-    and (hl)                   ; Keep non-character pixels
-    or e                       ; Merge in font spill pixels
-    ld (hl), a
-
-.no_spill:
-    pop hl                     ; Restore screen address
-    inc h                      ; Next scan line (SSS += 1)
-    pop bc                     ; Restore loop counter
-    djnz .scan
-
-    ret
+    jp z, .shift1
+    dec a
+    jp z, .shift2
+    dec a
+    jp z, .shift3
+    dec a
+    jp z, .shift4
+    dec a
+    jp z, .shift5
+    dec a
+    jp z, .shift6
+    jp .shift7
 
 .render32:
     ; --- 32-col path: col * 8, byte-aligned, direct write ---
@@ -954,6 +913,200 @@ _render_char:
     inc h                      ; Next scan line
     djnz .scan32
 
+    ret
+
+; --- Shift-specialised 51-col bodies ---
+; Entry: IX = font, HL = screen addr (row, scan 0, byte_col).
+; Each body renders 8 scan lines and returns.
+
+; shift=0: pixels in bits 7..3. Mask 0xF8, keep 0x07, no spill.
+.shift0:
+    ld b, 8
+.s0_scan:
+    ld d, (ix + 0)
+    inc ix
+    ld a, (hl)
+    and 0x07
+    or d
+    ld (hl), a
+    inc h
+    djnz .s0_scan
+    ret
+
+; shift=1: pixels in bits 6..2. Mask 0x7C, keep 0x83, no spill.
+.shift1:
+    ld b, 8
+.s1_scan:
+    ld d, (ix + 0)
+    inc ix
+    srl d
+    ld a, (hl)
+    and 0x83
+    or d
+    ld (hl), a
+    inc h
+    djnz .s1_scan
+    ret
+
+; shift=2: pixels in bits 5..1. Mask 0x3E, keep 0xC1, no spill.
+.shift2:
+    ld b, 8
+.s2_scan:
+    ld d, (ix + 0)
+    inc ix
+    srl d
+    srl d
+    ld a, (hl)
+    and 0xC1
+    or d
+    ld (hl), a
+    inc h
+    djnz .s2_scan
+    ret
+
+; shift=3: pixels in bits 4..0. Mask 0x1F, keep 0xE0, no spill.
+.shift3:
+    ld b, 8
+.s3_scan:
+    ld d, (ix + 0)
+    inc ix
+    srl d
+    srl d
+    srl d
+    ld a, (hl)
+    and 0xE0
+    or d
+    ld (hl), a
+    inc h
+    djnz .s3_scan
+    ret
+
+; shift=4: hi mask 0x0F (keep 0xF0), lo mask 0x80 (keep 0x7F).
+.shift4:
+    ld b, 8
+.s4_scan:
+    ld d, (ix + 0)
+    inc ix
+    ld e, 0
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    ld a, (hl)
+    and 0xF0
+    or d
+    ld (hl), a
+    inc l
+    ld a, (hl)
+    and 0x7F
+    or e
+    ld (hl), a
+    dec l
+    inc h
+    djnz .s4_scan
+    ret
+
+; shift=5: hi mask 0x07 (keep 0xF8), lo mask 0xC0 (keep 0x3F).
+.shift5:
+    ld b, 8
+.s5_scan:
+    ld d, (ix + 0)
+    inc ix
+    ld e, 0
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    ld a, (hl)
+    and 0xF8
+    or d
+    ld (hl), a
+    inc l
+    ld a, (hl)
+    and 0x3F
+    or e
+    ld (hl), a
+    dec l
+    inc h
+    djnz .s5_scan
+    ret
+
+; shift=6: hi mask 0x03 (keep 0xFC), lo mask 0xE0 (keep 0x1F).
+.shift6:
+    ld b, 8
+.s6_scan:
+    ld d, (ix + 0)
+    inc ix
+    ld e, 0
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    ld a, (hl)
+    and 0xFC
+    or d
+    ld (hl), a
+    inc l
+    ld a, (hl)
+    and 0x1F
+    or e
+    ld (hl), a
+    dec l
+    inc h
+    djnz .s6_scan
+    ret
+
+; shift=7: hi mask 0x01 (keep 0xFE), lo mask 0xF0 (keep 0x0F).
+.shift7:
+    ld b, 8
+.s7_scan:
+    ld d, (ix + 0)
+    inc ix
+    ld e, 0
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    srl d
+    rr e
+    ld a, (hl)
+    and 0xFE
+    or d
+    ld (hl), a
+    inc l
+    ld a, (hl)
+    and 0x0F
+    or e
+    ld (hl), a
+    dec l
+    inc h
+    djnz .s7_scan
     ret
 
 

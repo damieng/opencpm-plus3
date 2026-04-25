@@ -1060,7 +1060,9 @@ select_drive:
     ret z
     ld a, c
     push ix                    ; fdc_login (via BIOS) clobbers IX
+    push bc                    ; .select_body/build_alv clobbers BC; keep requested drive in C
     call .select_body
+    pop bc
     jr c, .sd_err              ; invalid drive — leave cached_drive alone
     ld a, c
     ld (cached_drive), a       ; mark this drive as the currently cached one

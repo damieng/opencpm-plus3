@@ -105,6 +105,7 @@ search_drv: db 0               ; Drive being searched
 search_pos: dw 0               ; Next directory entry to examine
 search_fcb: dw 0               ; FCB being searched for
 last_dir_sec: db 0xFF          ; Directory sector of last read_dir_entry (0xFF=invalid)
+last_dir_drv: db 0xFF          ; Drive of last read_dir_entry cache (0xFF=invalid)
 
 ; Cached DPB values for current disk (avoid repeated pointer chasing)
 cached_spt: dw 0               ; Sectors per track
@@ -1217,6 +1218,7 @@ build_alv:
     ; Invalidate directory sector cache
     ld a, 0xFF
     ld (last_dir_sec), a
+    ld (last_dir_drv), a
     ; Clear ALV
     ld hl, (cached_alv)
     ld a, (cached_dsm)
@@ -1483,13 +1485,18 @@ read_dir_entry:
 
     ; Check if this sector is already cached in dirbuf
     ld b, a                    ; B = sector number
+    ld a, (disk_drive)
+    ld c, a                    ; C = currently selected BIOS drive
+    ld a, (last_dir_drv)
+    cp c
+    jr nz, .need_read
     ld a, (last_dir_sec)
     cp b
     jr z, .dir_cached          ; Same sector — skip disk read
 
     ; Read this directory sector via BIOS
+.need_read:
     ld a, b
-    ld (last_dir_sec), a       ; Save sector number for write_dir_entry
     call dir_sector_to_bios    ; Set BIOS track/sector
 
     ; Save user DMA, then redirect to our internal directory buffer
@@ -1499,9 +1506,17 @@ read_dir_entry:
     call set_dma
 
     ; Read via BIOS
+    push bc                    ; Preserve cache key across disk_read clobbers
     call disk_read
     or a
+    pop bc
     jp nz, .read_error_dma
+
+    ; Cache is valid only after a successful read.
+    ld a, b
+    ld (last_dir_sec), a       ; Save sector number for write_dir_entry
+    ld a, c
+    ld (last_dir_drv), a
 
     ; Restore user DMA
     pop hl
@@ -1531,6 +1546,9 @@ read_dir_entry:
 .read_error_dma:
     pop hl                     ; saved bdos_dma
     ld (bdos_dma), hl          ; Restore user DMA before returning
+    ld a, 0xFF
+    ld (last_dir_sec), a
+    ld (last_dir_drv), a
     pop af                     ; entry-number af pushed at top of routine
     scf
     ret

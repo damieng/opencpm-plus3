@@ -49,6 +49,46 @@ workflow as a regression to investigate before committing.
 
 ## Test Flow
 
+## Fast Regression Gate
+
+Use this shorter gate whenever boot/common/BDOS layout changes:
+
+```text
+model +3
+load build/cpm3.dsk
+disk_boot
+run 1000
+```
+
+Read `char_buffer` at the address shown in `build/bios.lst` and require:
+
+- the signon line contains `Open CP/M +3`
+- the signon line reports the expected TPA size
+- a later row contains `A>`
+
+Then run:
+
+```text
+type "DUMP RPED.SUB`enter`"
+run 2000
+```
+
+Read `char_buffer` again and require:
+
+- the command line contains `A>DUMP RPED.SUB`
+- output contains `0000:`
+- execution is not spinning in common-memory copy code
+
+For optional RAMDISK.FID coverage, rebuild with:
+
+```text
+build.cmd --add build\RAMDISK.FID
+```
+
+Repeat the same boot check and require `A>` again. This catches the common
+class of regressions where a FID/layout change assembles but corrupts boot,
+page-zero setup, BDOS stack, or the bank-4 system image.
+
 ### 1. Boot and initial directory
 
 At the CCP prompt, run:
@@ -146,6 +186,38 @@ DIR A:*.SUB
 Check:
 
 - `RPED.SUB` is present again
+
+### 7. C: ramdisk — copy a COM and execute from it
+
+Requires the build to have included `RAMDISK.FID` (rebuild with
+`build.cmd --add build\RAMDISK.FID` if it isn't already on the disk).
+
+At the CCP prompt:
+
+```text
+DIR C:
+PIP C:=A:DATE.COM
+DIR C:
+C:
+DATE
+A:
+```
+
+Check:
+
+- the first `DIR C:` shows an empty directory (`No file` or similar) — proves
+  C: is registered and the FID's `rd_init` zeroed block 0
+- `PIP` completes without error; `fdc_log` shows reads of `DATE.COM` from A:
+  but **no FDC writes** (C: writes go through `rd_write` into bank 7)
+- the second `DIR C:` lists `DATE.COM`
+- `C:` switches the prompt to `C>`
+- `DATE` runs from C: and prints the current date/time — proves the FID's
+  `rd_read` deblocked the COM correctly into the TPA via `copy_record_to_tpa`
+- returning to `A:` works
+
+If `DIR C:` reports an invalid drive, `load_fid` either didn't find
+`RAMDISK.FID` or the magic check failed — check `_fid_block` and the FID
+header at `0x9000` in bank 6.
 
 ## Suggested MCP Input Pattern
 

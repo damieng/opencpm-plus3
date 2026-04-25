@@ -1,12 +1,12 @@
 ; ==========================================================================
-; CP/M 3.1 Common Memory Stub (FA00-FFFF)
+; CP/M 3.1 Common Memory Stub (F600-FFFF)
 ; ==========================================================================
 ;
 ; Resident in bank 3, visible in both TPA (mode 0) and system (mode 2).
 ; Contains the thin dispatcher that bridges user programs to the banked
 ; BDOS/BIOS, plus inter-bank copy routines for DMA transfers.
 ;
-; Included from bios.asm inside a PHASE 0xFA00 block.
+; Included from bios.asm inside a PHASE COMMON_BASE block.
 ;
 ; ==========================================================================
 
@@ -336,7 +336,7 @@ userf_stub:
     inc hl                         ; HL = corrected return (past the DW)
     ex (sp), hl                    ; return on stack, HL = caller HL
     ; Dispatch every XBIOS ID to the bank-4 handler. Common memory is too
-    ; tight (FA00-FFFF) to inline the per-function return values, and the
+    ; tight (F600-FFFF) to inline the per-function return values, and the
     ; bank switch adds only a few hundred T-states per call.
     ld hl, xbios_handler
     jp bios_call_bank4
@@ -796,6 +796,12 @@ copy_record_from_tpa:
     ld bc, 128
     jp copy_from_user
 
+; RAMDISK.FID hardcodes these two addresses (see src/fid/ramdisk.asm).
+; If these asserts fail, common memory has shifted and the FID source
+; needs its COPY_RECORD_*_TPA equates updated.
+    assert copy_record_to_tpa == 0xF9A1, "RAMDISK.FID expects copy_record_to_tpa at 0xF9A1"
+    assert copy_record_from_tpa == 0xF9A7, "RAMDISK.FID expects copy_record_from_tpa at 0xF9A7"
+
 
 ; ------------------------------------------------------------------
 ; copy_block_to_tpa — Copy arbitrary-length block from system to TPA
@@ -882,7 +888,9 @@ _ibm_byte:     db 0
 drive_table:
     dw xdph_a                      ; A: — +3 floppy
     dw xdph_b                      ; B: — +3 floppy (alias of A:, same physical drive)
-    dw 0, 0                        ; C:, D:
+drive_table_c_slot:
+    dw 0                           ; C: — patched to xdph_c by load_fid (or stays 0)
+    dw 0                           ; D:
     dw 0, 0, 0, 0                  ; E: through H:
     dw 0, 0, 0, 0                  ; I: through L:
     dw 0, 0, 0, 0                  ; M: through P:
@@ -918,6 +926,24 @@ xdph_b:
     dw xdpb_b                  ; DPB pointer — per-drive XDPB
     dw csv_b                   ; CSV: B:'s checksum vector
     dw alv_b                   ; ALV: B:'s allocation vector
+
+; XDPH prefix for C: (RAM disk via loadable FID).  All four routine
+; slots are zero at boot; load_fid patches them with addresses inside
+; the FID code (loaded at 0x9000 in bank 6) once it has validated the
+; module.  drive_table_c_slot stays 0 unless load_fid succeeds.
+xdph_c_write_slot: dw 0       ; -10: write routine
+xdph_c_read_slot:  dw 0       ; -8:  read routine
+xdph_c_login_slot: dw 0       ; -6:  login routine
+xdph_c_init_slot:  dw 0       ; -4:  init routine
+                   db 2, 0    ; -2:  relative drive 2
+
+xdph_c:
+    dw 0                       ; XLT: no sector translate
+    dw 0, 0, 0                 ; Scratch (per-drive BDOS state)
+    dw dirbuf                  ; DIRBUF (shared)
+    dw xdpb_c                  ; DPB pointer
+    dw alv_c                   ; CSV: CKS=0 so unused; point at alv_c harmlessly
+    dw alv_c                   ; ALV: allocation vector (bank 4, BDOS only)
 
 ; Per-drive XDPBs (27 bytes each). Bytes 0-16: standard CP/M 3 DPB;
 ; bytes 17-26: Amstrad XBIOS extension. Initialised to the +3 SS/SD
@@ -969,6 +995,12 @@ xdpb_b:
     db 0x40
     db 0
 
+; XDPB for C: — load_fid copies the FID's XDPB template here.  Stays
+; zero if no FID is loaded (drive is invisible because drive_table_c_slot
+; is also zero in that case).
+xdpb_c:
+    ds 27, 0
+
 
 ; ==========================================================================
 ; Buffers
@@ -994,13 +1026,13 @@ xfer_staging: ds 32
 
 ; BDOS stack (grows downward from bdos_stack label)
 bdos_stack_base:
-    ds 64
-bdos_stack:
-    assert bdos_stack - bdos_stack_base == 64, "BDOS stack must be 64 bytes"
+bdos_stack equ bdos_stack_base + 128
+    assert bdos_stack - bdos_stack_base == 128, "BDOS stack must be 128 bytes"
+    assert bdos_stack <= 0x10000, "BDOS stack must fit in common memory"
 
 ; ==========================================================================
 ; End of common memory stub
 ; ==========================================================================
-common_end:
+common_end equ bdos_stack
 
     assert common_end <= 0xFFFF, "Common stub overflows bank 3!"

@@ -5,20 +5,20 @@
 ; Memory layout:
 ;   TPA (mode 0: banks 0,1,2,3):
 ;     0000-00FF   Page zero (JP stubs to common memory)
-;     0100-F9FF   TPA (~63K)
-;     FA00-FFFF   Common memory stub (bank 3, always visible)
+;     0100-F5FF   TPA (~61K)
+;     F600-FFFF   Common memory stub (bank 3, always visible)
 ;
 ;   System (mode 3: banks 4,7,6,3):
 ;     0000-3FFF   Bank 4 — BIOS, BDOS, drivers, font, buffers
 ;     4000-7FFF   Bank 7 — System data / growth
 ;     8000-BFFF   Bank 6 — Reserved for growth
-;     FA00-FFFF   Common memory stub (bank 3, always visible)
+;     F600-FFFF   Common memory stub (bank 3, always visible)
 ;
 ;   Screen access (mode 2: banks 4,5,6,3):
 ;     4000-7FFF   Bank 5 — Screen RAM (paged in temporarily)
 ;
 ; The loader places CPM3.SYS at C000h (bank 3). The init code below
-; copies the system image to bank 4 and the common stub to FA00h,
+; copies the system image to bank 4 and the common stub to F600h,
 ; then jumps to cold_boot in bank 4.
 ;
 ; Assembled with:
@@ -46,6 +46,7 @@ MOTOR_BIT   equ 0x08              ; OR this in for motor on
 ; --- CP/M constants ---
 CCP_ADDR    equ 0x0100            ; CCP loads here in TPA
 JMP_OPCODE  equ 0xC3              ; JP instruction
+COMMON_BASE equ 0xF600            ; Start of bank-3 common memory
 
 
 ; ######################################################################
@@ -58,25 +59,37 @@ JMP_OPCODE  equ 0xC3              ; JP instruction
 init:
     di
 
-    ; ---- Install common memory stub at FA00h (bank 3) ----
-    ; common_image sits at F591..FB50 (file layout), needs to land at FA00..FFBF.
-    ; Ranges overlap (FA00..FB50), so we MUST use backward copy (LDDR).
-_copy_common_size equ common_image_end - common_image
-    assert common_image < 0xFA00, "common_image must be below FA00"
-    ; LDDR (backward copy) is always safe regardless of overlap direction
-    ld hl, common_image + _copy_common_size - 1
-    ld de, 0xFA00 + _copy_common_size - 1
-    ld bc, _copy_common_size
-    lddr
-
     ; ---- Copy system code to bank 4 at 0000h ----
-    ; We're in mode 2 (loader left us here): bank 4 @ 0000, bank 3 @ C000
+    ; We're in mode 2 (loader left us here): bank 4 @ 0000, bank 3 @ C000.
+    ; Do this before installing common.  With COMMON_BASE below the physical
+    ; tail of system_image, copying common first would overwrite bytes that
+    ; this LDIR still needs to read.
 _copy_sys_size equ system_image_end - system_image
     assert system_image >= (0x0000 + _copy_sys_size), "LDIR safe: no overlap (src >= dst+count)"
     ld hl, system_image
     ld de, 0x0000
     ld bc, _copy_sys_size
     ldir
+
+    ; ---- Install common memory stub at COMMON_BASE (bank 3) ----
+    ; common_image sits in the file just past system_image; it must be
+    ; copied to COMMON_BASE.  Source and destination usually overlap, so the
+    ; copy direction matters: LDDR is safe when src starts BELOW dst,
+    ; LDIR is safe when src starts AT/ABOVE dst.  We pick at assembly
+    ; time based on where common_image actually landed.
+_copy_common_size equ common_image_end - common_image
+    assert _copy_common_size <= 0x10000 - COMMON_BASE, "common stub overflows bank 3"
+    IF common_image < COMMON_BASE
+    ld hl, common_image + _copy_common_size - 1
+    ld de, COMMON_BASE + _copy_common_size - 1
+    ld bc, _copy_common_size
+    lddr
+    ELSE
+    ld hl, common_image
+    ld de, COMMON_BASE
+    ld bc, _copy_common_size
+    ldir
+    ENDIF
 
     ; ---- Jump to cold_boot (now live in bank 4) ----
     jp cold_boot
@@ -164,6 +177,7 @@ cold_boot:
     call kbd_init                  ; Keyboard: reset state
     call fdc_init                  ; FDC: recalibrate drive
     call load_fonts                ; Load fonts from disk into bank 7
+    call load_fid                  ; Optional: register C: ramdisk if RAMDISK.FID present
     call motor_off                 ; Spin drive down before CCP takes over
 
     ; Print signon
@@ -374,8 +388,10 @@ set_dma:
 ; defaults out of xdpb_a / xdpb_b.
 sel_disk:
     ld a, %drive
+    cp 3
+    jr nc, .bad_drive              ; Drives 0 (A:), 1 (B:), 2 (C: ramdisk)
     cp 2
-    jr nc, .bad_drive              ; Only drives 0 (A:) and 1 (B:) exist
+    jr z, .sel_c                   ; C: needs FID-supplied login, not fdc_login
     ld (disk_drive), a
     bit 0, %login
     jr nz, .pick_dph               ; bit 0 = 1 → already logged in → fast path
@@ -391,6 +407,16 @@ sel_disk:
 .is_b:
     ld hl, xdph_b
     ret
+.sel_c:
+    ; Reject if no FID was loaded.  RAM disk needs no login probe — the
+    ; loader populated xdpb_c at boot and the format never changes.
+    ld hl, (drive_table_c_slot)
+    ld a, h
+    or l
+    jr z, .bad_drive
+    ld a, 2
+    ld (disk_drive), a
+    ret
 .bad_drive:
     ld hl, 0
     ret
@@ -400,14 +426,37 @@ sel_disk:
 ; @clobbers af,bc,de,hl
 ; @end
 disk_read:
-    jp fdc_read
+    ld a, (disk_drive)
+    cp 2
+    jp c, fdc_read                 ; A: or B: → floppy
+    ld iy, (xdph_c_read_slot)
+    jr _disk_io_c
 
 ; @proc disk_write
 ; @out a                           ; 0=ok, 1=error, 2=read-only
 ; @clobbers af,bc,de,hl
 ; @end
 disk_write:
-    jp fdc_write
+    ld a, (disk_drive)
+    cp 2
+    jp c, fdc_write                ; A: or B: → floppy
+    ld iy, (xdph_c_write_slot)
+    ; fall through to _disk_io_c
+_disk_io_c:
+    push ix
+    push iy
+    ld hl, (disk_sector)
+    ld de, (disk_dma)
+    call _call_iy
+    pop iy
+    pop ix
+    ret
+
+; Helper used by the FID dispatcher (Z80 has no "call (iy)" — emulate
+; via call→jp register).
+_call_iy:
+    ; lint-exempt: stack
+    jp (iy)
 
 ; @proc sec_trn
 ; @param %lsec:u16  bc             ; logical sector
@@ -580,7 +629,7 @@ print_str:
     inc %str
     jr print_str
 
-BUILD_NUM equ 160
+BUILD_NUM equ 171
 
 TPA_KB equ (bdos_stub - 0x0100) / 1024
 
@@ -642,6 +691,7 @@ load_fonts:
     ld (_font51_blk1), a
     ld (_font32_blk0), a
     ld (_font32_blk1), a
+    ld (_fid_block), a              ; FID not yet found; load_fid will check this
 
     ; Seek to track 1 (first data track: OFF=1)
     ld a, 1
@@ -673,8 +723,8 @@ load_fonts:
     pop bc
 
     ld a, (_lf_found)
-    cp 3
-    jr z, .lf_dsec_done             ; found both — done early
+    cp 7
+    jr z, .lf_dsec_done             ; found font51, font32, FID — done early
     inc c
     jr .lf_dsec
 
@@ -708,10 +758,6 @@ _lf_check_entry:
     pop hl
     jr nz, .lf_try32
 
-    ld a, (_lf_found)
-    bit 0, a
-    jr nz, .lf_done                 ; already have font51 blocks
-    push hl
     ld bc, 16
     add hl, bc                      ; HL = &entry[16] = AL[0]
     ld a, (hl)
@@ -719,11 +765,10 @@ _lf_check_entry:
     inc hl
     ld a, (hl)
     ld (_font51_blk1), a
-    pop hl
     ld a, (_lf_found)
     or 0x01
     ld (_lf_found), a
-    jr .lf_done
+    ret
 
 .lf_try32:
     push hl
@@ -732,12 +777,8 @@ _lf_check_entry:
     ld b, 11
     call _lf_cmp11
     pop hl
-    jr nz, .lf_done
+    jr nz, .lf_try_fid
 
-    ld a, (_lf_found)
-    bit 1, a
-    jr nz, .lf_done
-    push hl
     ld bc, 16
     add hl, bc
     ld a, (hl)
@@ -745,12 +786,26 @@ _lf_check_entry:
     inc hl
     ld a, (hl)
     ld (_font32_blk1), a
-    pop hl
     ld a, (_lf_found)
     or 0x02
     ld (_lf_found), a
+    ret
 
-.lf_done:
+.lf_try_fid:
+    push hl
+    inc hl
+    ld de, _lf_name_fid
+    ld b, 11
+    call _lf_cmp11
+    pop hl
+    ret nz
+    ld bc, 16
+    add hl, bc
+    ld a, (hl)
+    ld (_fid_block), a              ; AL[0] = first 1K block of RAMDISK.FID
+    ld a, (_lf_found)
+    or 0x04
+    ld (_lf_found), a
     ret
 
 
@@ -868,16 +923,90 @@ _lf_div9:
     ret
 
 
-; --- Font loader data ---
-_lf_found:    db 0                  ; bit 0=font51 found, bit 1=font32 found
+; --- Font/FID loader data ---
+_lf_found:    db 0                  ; bit 0=font51, 1=font32, 2=fid
 _font51_blk0: db 0                  ; first block number of FONT51.BIN
 _font51_blk1: db 0                  ; second block number
 _font32_blk0: db 0                  ; first block number of FONT32.BIN
 _font32_blk1: db 0
+_fid_block:   db 0                  ; first block number of RAMDISK.FID (0 = absent)
 _lf_abs_phys: dw 0                  ; scratch: current absolute physical sector
 _lf_sec_id:   db 0                  ; scratch: sector ID saved across fdc_seek
 _lf_name51:   db "FONT51  BIN"      ; 11-char CP/M name (6+2spaces+3ext)
 _lf_name32:   db "FONT32  BIN"
+_lf_name_fid: db "RAMDISK FID"
+_fid_magic:   db "OCFID", 0         ; 6-byte signature inside RAMDISK.FID
+
+
+; ==========================================================================
+; load_fid — Register C: if the RAMDISK.FID dir scan during load_fonts
+; found one.  Loads its first 1K block to 0x9000 in bank 6, verifies the
+; OCFID magic, copies the XDPB template into xdpb_c, fills xdph_c's
+; prefix slots from the header's entry-point fields, points drive_table[2]
+; at xdph_c, and tail-calls the FID's init routine.
+;
+; Helper stub addresses are NOT patched — RAMDISK.FID hardcodes
+; copy_record_to_tpa / copy_record_from_tpa addresses (asserts in
+; common.zpa pin them).
+;
+;   In:  _fid_block populated by load_fonts (0 = no FID found),
+;        motor on, drive 0 selected
+;   Out: nothing
+;   Clobbers: AF, BC, DE, HL, IY
+; ==========================================================================
+; @proc load_fid
+; @clobbers af,bc,de,hl,iy
+; @end
+load_fid:
+    ld a, (_fid_block)
+    or a
+    ret z                           ; no FID found in dir scan
+
+    ; Load the FID's first 1K block to 0x9000 in bank 6
+    ld de, 0x9000
+    call _lf_load_block             ; A = block #, DE = dest
+
+    ; Validate "OCFID\0" magic at 0x9000
+    ld hl, 0x9000
+    ld de, _fid_magic
+    ld b, 6
+.vm:
+    ld a, (de)
+    cp (hl)
+    ret nz                          ; bad magic — abort registration
+    inc de
+    inc hl
+    djnz .vm
+
+    ; Copy entry addresses (8 bytes: write, read, login, init) into the
+    ; xdph_c prefix slots — header layout matches slot order so a single
+    ; LDIR does it.
+    ld hl, 0x9000 + 12
+    ld de, xdph_c_write_slot
+    ld c, 8
+    ldir
+
+    ; Copy 27-byte XDPB template (header[+24..+50]) into xdpb_c
+    ld hl, 0x9000 + 24
+    ld de, xdpb_c
+    ld c, 27
+    ldir
+
+    ; Run init before making C: visible.  A non-zero return leaves
+    ; drive_table[2] at zero, so the FID remains unmounted.
+    ld iy, (xdph_c_init_slot)
+    call _call_iy
+    or a
+    ret nz
+
+    ; Wire drive_table[2] = xdph_c only after init succeeds.
+    ld hl, xdph_c
+    ld (drive_table_c_slot), hl
+    ret
+
+; ALV vector for C: — read/written by BDOS while bank 4 is mapped.
+; 16 blocks → ceil(16/8) = 2 bytes; add slack for safety.
+alv_c:          ds 4
 
 
 ; ==========================================================================
@@ -903,16 +1032,15 @@ system_end:
     DEPHASE
 system_image_end:
 
-
 ; ######################################################################
-; COMMON MEMORY STUB — Lives at FA00-FFFF (bank 3, always visible)
+; COMMON MEMORY STUB — Lives at F600-FFFF (bank 3, always visible)
 ; ######################################################################
 ;
-; Assembled with PHASE 0xFA00 so labels resolve to common memory addresses.
-; The init code copies these bytes from the binary to FA00h.
+; Assembled with PHASE COMMON_BASE so labels resolve to common memory addresses.
+; The init code copies these bytes from the binary to COMMON_BASE.
 
 common_image:
-    PHASE 0xFA00
+    PHASE COMMON_BASE
 
     include "common.asm"
 

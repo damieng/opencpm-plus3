@@ -56,6 +56,10 @@ echo   Assembling utilities...
 %SJASMPLUS% --raw=build\dump.com src\tools\dump.asm
 %SJASMPLUS% --raw=build\setdef.com src\tools\setdef.asm
 
+echo   Assembling FID modules...
+%SJASMPLUS% --raw=build\RAMDISK.FID src\fid\ramdisk.asm
+if errorlevel 1 goto :fail
+
 :: Stage 2: Build DSK
 echo   Building DSK...
 copy /y build\bios.bin build\CPM3.SYS >nul
@@ -63,7 +67,16 @@ copy /y build\bios.bin build\CPM3.SYS >nul
 set REF_BINS=
 for %%F in (references\binaries\*.COM references\binaries\*.SUB) do set REF_BINS=!REF_BINS! %%F
 
-python3 tools\mkdsk.py create build\cpm3.dsk --boot build\bootsect.bin --system build\loader.bin --add build\CPM3.SYS src\bios\font51.bin src\bios\font32.bin build\bdostest.com build\xtetest.com build\disktest.com build\termtest.com build\date.com build\showxdpb.com build\dump.com build\setdef.com !REF_BINS! %*
+set EXTRA_FILES=
+if /I "%~1"=="--add" shift
+:collect_extra_files
+if "%~1"=="" goto extra_files_done
+set EXTRA_FILES=!EXTRA_FILES! %1
+shift
+goto collect_extra_files
+:extra_files_done
+
+python3 tools\mkdsk.py create build\cpm3.dsk --boot build\bootsect.bin --system build\loader.bin --add build\CPM3.SYS src\bios\font51.bin src\bios\font32.bin build\bdostest.com build\xtetest.com build\disktest.com build\termtest.com build\date.com build\showxdpb.com build\dump.com build\setdef.com !REF_BINS! !EXTRA_FILES!
 if errorlevel 1 goto :fail
 
 for %%A in (build\loader.bin) do echo   Loader: %%~zA bytes

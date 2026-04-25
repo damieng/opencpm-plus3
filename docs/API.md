@@ -34,7 +34,7 @@ This document covers the BDOS, BIOS, terminal, and program conventions for writi
 0081h  ds 127                ; command tail text (default DMA buffer)
 0100h  ...program code...    ; entry point
        ...
-FA00h  common memory starts  ; system stubs, not usable by programs
+F600h  common memory starts  ; system stubs, not usable by programs
 ```
 
 ### Entry Conditions
@@ -60,7 +60,7 @@ Programs should close any open files before exiting (BDOS F16).
 
 ### TPA Size
 
-~63K available (0100h to ~FA00h). The exact top is in the word at 0006h.
+~61K available (0100h to ~F600h). The exact top is in the word at 0006h.
 
 ---
 

@@ -85,7 +85,7 @@ MAX_RETRIES equ 10
 ; drive_table, xdph_a, dpb_plus3 — moved to common memory (common.zpa)
 ; so TPA programs (DISCKIT.COM etc.) can dereference them after DRVTBL/SELDSK.
 ; Labels are still visible here because common.zpa is assembled in the same
-; sjasmplus pass (included from bios.asm inside a PHASE 0xFA00 block).
+; sjasmplus pass (included from bios.asm inside a PHASE COMMON_BASE block).
 ; ==========================================================================
 
 

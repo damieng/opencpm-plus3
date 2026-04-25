@@ -1065,11 +1065,10 @@ parse_cmd:
     ; loaded program. Place it just below the SCB base (start of
     ; common memory). Must NOT use bios_visible-36 which overlaps
     ; the SCB date/time fields, nor bdos_stub area.
-    ; SCB base = scb_common value = word stored at page zero 0x0001
-    ; minus 3 (bios_visible), minus 100 (SCB size). But simpler:
-    ; the BIOS stores scb_common at SCB offset 0x3A. We know common
-    ; memory starts at FA00h for our system, so use that directly.
-    ld hl, 0xFA00 - 36         ; Just below SCB base
+    ; The BIOS stores scb_common at SCB offset 0x3A. We keep this
+    ; scratch FCB just below common memory so the loaded COM does not
+    ; overwrite it while the page-zero loader stub is still reading.
+    ld hl, 0xF600 - 36         ; Just below SCB base
     ld (.stub_fcb_addr), hl    ; Save for patching the stub
     ex de, hl                  ; DE = high TPA FCB address
     ld hl, type_fcb

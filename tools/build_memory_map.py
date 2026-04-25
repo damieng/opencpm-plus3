@@ -6,7 +6,7 @@ top-level label with its logical address. Groups them into sections:
 
   - Init           : physical file addresses before the first PHASE
   - System bank 4  : PHASE 0x0000 .. DEPHASE (logical 0x0000..0x3FFF)
-  - Common stub    : PHASE 0xFA00 .. DEPHASE (logical 0xFA00..0xFFFF)
+  - Common stub    : PHASE 0xF600 .. DEPHASE (logical 0xF600..0xFFFF)
   - Image tail     : physical addresses after the last DEPHASE
 
 Each section is printed with label, logical address, span-to-next-label,
@@ -70,11 +70,11 @@ def parse_listing(path: Path) -> list[Section]:
 
     - file:   physical CPM3.SYS layout (addresses at `org 0xC000` and later)
     - system: PHASE 0x0000 block (bank 4 runtime labels)
-    - common: PHASE 0xFA00 block (common memory stub runtime labels)
+    - common: PHASE 0xF600 block (common memory stub runtime labels)
     """
     file_section = Section("CPM3.SYS file layout", base=0xC000, limit=0x10000, labels=[])
     system_section = Section("System bank 4", base=0x0000, limit=0x4000, labels=[])
-    common_section = Section("Common memory", base=0xFA00, limit=0x10000, labels=[])
+    common_section = Section("Common memory", base=0xF600, limit=0x10000, labels=[])
 
     section_stack: list[Section] = [file_section]
 
@@ -93,7 +93,7 @@ def parse_listing(path: Path) -> list[Section]:
                 assert base is not None
                 if base == 0x0000:
                     section_stack.append(system_section)
-                elif base == 0xFA00:
+                elif base == 0xF600:
                     section_stack.append(common_section)
                 else:
                     raise SystemExit(f"Unexpected PHASE base 0x{base:04X}")

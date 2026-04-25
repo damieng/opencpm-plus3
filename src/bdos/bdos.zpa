@@ -1095,6 +1095,8 @@ select_drive:
     ld a, e
     or a
     jr nz, .skip_login         ; E=1 → already logged in this session
+    bit 1, c
+    jr nz, .skip_login         ; non-FDC drives provide their own SELDSK/login
     push hl                    ; save DPH (fdc_login clobbers HL, IX)
     push bc                    ; save drive in C (fdc_login clobbers BC)
     call fdc_login

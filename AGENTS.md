@@ -43,21 +43,21 @@ OCR does not work with our custom 5px font.
 ### Boot Chain
 1. Boot sector (512B at FE00h) → loads loader from track 0
 2. Loader (917B) → finds CPM3.SYS in directory, loads to C000h
-3. Init code at C000h → copies system to bank 4, common stub to FA00h
+3. Init code at C000h → copies system to bank 4, common stub to F600h
 4. Cold boot in bank 4 → init screen/kbd/FDC, inter-bank copy CCP to 0100h
 5. start_tpa (common) → switch to TPA mode, set page zero, JP 0100h
 
 ### Memory Layout (Banked)
 **TPA mode (mode 0: banks 0,1,2,3)**:
 - **0000-00FF**: Page zero — JP warm_boot_stub, JP bdos_stub, JP isr_handler
-- **0100-F9FF**: TPA (~63K)
-- **FA00-FFFF**: Common memory stub (bank 3, always visible)
+- **0100-F5FF**: TPA (~61K)
+- **F600-FFFF**: Common memory stub (bank 3, always visible)
 
 **System mode (mode 3: banks 4,7,6,3)**:
 - **0000-3FFF**: Bank 4 — BIOS, BDOS, screen/kbd/FDC drivers, font, buffers, CCP image
 - **4000-7FFF**: Bank 7 — System data / growth
 - **8000-BFFF**: Bank 6 — Reserved
-- **FA00-FFFF**: Common memory stub (bank 3, always visible)
+- **F600-FFFF**: Common memory stub (bank 3, always visible)
 
 **Screen access (mode 2: banks 4,5,6,3)**:
 - **4000-7FFF**: Bank 5 — Screen RAM (paged in temporarily by `_page_in`/`_page_out`)
@@ -68,7 +68,7 @@ OCR does not work with our custom 5px font.
 - Mode 2 (`PAGING_SCREEN=0x05`): banks 4,5,6,3 — screen access (temporary)
 - `MOTOR_BIT=0x08`: OR into 1FFD value for disk motor
 
-### Common Memory Stub (FA00-FFFF)
+### Common Memory Stub (F600-FFFF)
 The common stub bridges TPA and system banks:
 - `bdos_stub` — saves user SP, switches to system, calls bdos_entry, switches back
 - `warm_boot_stub` — switches to system, jumps to warm_boot
@@ -78,7 +78,7 @@ The common stub bridges TPA and system banks:
 - Inter-bank copy routines: `copy_record_to_tpa`, `copy_record_from_tpa`, `copy_block_to_tpa`
 - User memory helpers: `read_user_byte`, `write_user_byte`, `copy_from_user`, `copy_to_user`
 - FCB shadowing: `setup_fcb`, `writeback_fcb`, `fcb_buf` (36 bytes)
-- Buffers: `dirbuf` (128B), `xfer_staging` (128B), `bdos_stack` (64B)
+- Buffers: `dirbuf` (128B), `xfer_staging` (32B), `bdos_stack` (128B)
 
 ### BDOS Banking Model
 Interrupts are disabled during system mode. The BDOS accesses user memory
@@ -99,7 +99,7 @@ Interrupts are disabled during system mode. The BDOS accesses user memory
 
 - `src/boot/bootsect.asm` — Boot sector (checksum must be 3 mod 256)
 - `src/boot/loader.asm` — Stage 2: finds and loads CPM3.SYS from disk
-- `src/bios/bios.asm` — Init + BIOS (PHASE 0000 for bank 4) + common stub (PHASE FA00)
+- `src/bios/bios.asm` — Init + BIOS (PHASE 0000 for bank 4) + common stub (PHASE F600)
 - `src/bios/common.asm` — Common memory stub: BDOS dispatch, bank switching, inter-bank copy
 - `src/bios/screen.asm` — 51×24 display, 5px non-byte-aligned font rendering
 - `src/bios/keyboard.asm` — 8×5 matrix scan, ASCII mapping, debounce/repeat
@@ -140,7 +140,7 @@ When copying memory blocks with LDIR (forward) or LDDR (backward), source and de
 - **LDIR** (forward, HL→HL+BC to DE→DE+BC): safe only if `DE >= HL + BC` or `HL >= DE + BC`
 - **LDDR** (backward, HL down to HL-BC to DE down to DE-BC): safe even with overlap
 
-The init code copies common_image from its file-layout address to FA00h. Because the PHASE block makes labels resolve to FA00h but the binary data sits earlier in the file, these ranges overlap. If an `assert` fires about copy regions overlapping, switch the LDIR to LDDR (pointing HL/DE at the *last* byte instead of the first).
+The init code must copy `system_image` to bank 4 before copying `common_image` to F600h. `COMMON_BASE=F600` overlaps the physical source range of the loaded `system_image` in bank 3; copying common first corrupts bytes that still need to be relocated into bank 4. `tools/check_layout.py` verifies this order from `build/bios.lst`. The common copy itself still needs the correct LDIR/LDDR direction if its source/destination ranges overlap.
 
 ## Standard +3 Disk Format (DPB)
 ```

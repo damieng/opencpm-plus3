@@ -63,6 +63,9 @@ sjasmplus --raw=build/showxdpb.com src/tools/showxdpb.asm
 sjasmplus --raw=build/dump.com src/tools/dump.asm
 sjasmplus --raw=build/setdef.com src/tools/setdef.asm
 
+echo "  Assembling FID modules..."
+sjasmplus --raw=build/RAMDISK.FID src/fid/ramdisk.asm
+
 # Stage 2: Build DSK
 echo "  Building DSK..."
 EXTRAFILES=""

@@ -27,8 +27,16 @@ F_CSTAT equ 11                 ; Console status
 F_SCB   equ 49                 ; Get/Set SCB byte (DE→[offset,op]; op=0=get)
 F_BIOS  equ 50                 ; Direct BIOS call (DE→8-byte BIOSPB)
 F_CONMODE equ 109              ; Get/Set console mode word (F109)
+F_GET_ORD  equ 120             ; Get SETDEF order byte (F120)
+F_GET_PATH equ 122             ; Get SETDEF search path (DE = 4-byte buf)
 
 CON_MODE_DISPLAY equ 0x02      ; con_mode bit 1: echo SUBmit lines
+
+; SETDEF order byte values (must match BDOS bdos_order encoding).
+ORDER_COM_SUB equ 0
+ORDER_SUB_COM equ 1
+ORDER_COM     equ 2
+ORDER_SUB     equ 3
 
 ; ==========================================================================
 ; CCP Entry Point
@@ -626,29 +634,130 @@ parse_cmd:
     call parse_filename        ; Fills type_fcb from (HL)
     jp c, .com_unknown         ; Parse error
 
-    ; Force extension to "COM"
+    ; --- Build the working search-path list ---
+    ; Explicit drive in the command (e.g. "B:FOO") uses just that drive.
+    ; Otherwise pull the SETDEF search path. Either way, the result lands
+    ; in ccp_search_buf and the rest of the code walks it identically.
+    ld a, (type_fcb)
+    or a
+    jr z, .com_use_setdef_path
+    ld (ccp_search_buf), a
+    xor a
+    ld (ccp_search_buf + 1), a
+    ld (ccp_search_buf + 2), a
+    ld (ccp_search_buf + 3), a
+    jr .com_path_ready
+.com_use_setdef_path:
+    ld de, ccp_search_buf
+    ld c, F_GET_PATH
+    call BDOS
+.com_path_ready:
+
+    ; --- Apply ORDER: try the configured extensions in sequence ---
+    ld c, F_GET_ORD
+    call BDOS                  ; A = bdos_order
+    cp ORDER_SUB_COM
+    jr z, .com_order_sc
+    cp ORDER_COM
+    jr z, .com_order_c
+    cp ORDER_SUB
+    jr z, .com_order_s
+    ; default / ORDER_COM_SUB
+    call .com_try_com
+    call .com_try_sub
+    jp .com_unknown
+.com_order_c:
+    call .com_try_com
+    jp .com_unknown
+.com_order_s:
+    call .com_try_sub
+    jp .com_unknown
+.com_order_sc:
+    call .com_try_sub
+    call .com_try_com
+    jp .com_unknown
+
+; .com_try_com / .com_try_sub — Walk ccp_search_buf with the given extension.
+;   On success: tail-jumps to .com_opened (COM) or .com_chain_submit (SUB).
+;   On miss: returns to caller so the next extension can be tried.
+.com_try_com:
     ld a, 'C'
     ld (type_fcb + 9), a
     ld a, 'O'
     ld (type_fcb + 10), a
     ld a, 'M'
     ld (type_fcb + 11), a
+    call .com_clear_fcb_tail
+    call .com_walk_path
+    ret nc
+    jp .com_opened
 
-    ; Clear FCB fields 12-35 (EX, S1, S2, RC, alloc, CR)
+.com_try_sub:
+    ld a, 'S'
+    ld (type_fcb + 9), a
+    ld a, 'U'
+    ld (type_fcb + 10), a
+    ld a, 'B'
+    ld (type_fcb + 11), a
+    call .com_clear_fcb_tail
+    call .com_walk_path
+    ret nc
+    ; Found a .SUB hit. Real CP/M 3 would chain to SUBMIT.COM here, but
+    ; the reference SUBMIT.COM is an RSX (header begins C9 00 nn C9) and
+    ; our loader doesn't yet handle that format. Surface a clear message
+    ; and return all the way out (skipping the `jp .com_unknown` that the
+    ; ORDER dispatcher would otherwise hit, which would print a stray "?").
+    ld de, msg_sub_unsupported
+    ld c, 9                    ; F9: Print String
+    call BDOS
+    pop hl                     ; discard ORDER-dispatcher return
+    ret                        ; return to parse_cmd's caller
+
+.com_clear_fcb_tail:
     ld hl, type_fcb + 12
     ld b, 24
     xor a
-.clr_fcb:
+.cft_loop:
     ld (hl), a
     inc hl
-    djnz .clr_fcb
+    djnz .cft_loop
+    ret
 
-    ; Open the .COM file
+; .com_walk_path — Walk ccp_search_buf attempting F15 with the current
+;   extension on each non-empty drive slot.
+;   Out: CF=1 if a hit was found (type_fcb left holding the matched drive),
+;        CF=0 otherwise.
+.com_walk_path:
+    ld hl, ccp_search_buf
+    ld b, 4
+.wp_loop:
+    ld a, (hl)
+    or a
+    jr z, .wp_next
+    cp 0xFF
+    jr nz, .wp_set
+    xor a                      ; '*' → FCB drive = 0 (= current drive)
+.wp_set:
+    ld (type_fcb), a
+    push hl
+    push bc
     ld de, type_fcb
     ld c, 15                   ; F15: Open File
     call BDOS
+    pop bc
+    pop hl
     cp 0xFF
-    jp z, .com_unknown         ; Not found → print "?"
+    jr nz, .wp_found
+.wp_next:
+    inc hl
+    djnz .wp_loop
+    or a                       ; CF=0, not found
+    ret
+.wp_found:
+    scf                        ; CF=1, found
+    ret
+
+.com_opened:
 
     ; (Command tail is set up after FCB parsing, so clear_fcb_de
     ; on FCB2 at 006Ch doesn't clobber the tail at 0080h.)
@@ -1480,6 +1589,14 @@ screen_biospb:
 ; FCB for DIR command
 dir_fcb:
     ds 36
+
+; Buffer for SETDEF search path fetched via F_GET_PATH during command load
+ccp_search_buf:
+    ds 4
+
+; Surfaced when CCP finds a .SUB but can't run it (no RSX loader yet).
+msg_sub_unsupported:
+    db 'SUBMIT chaining not yet supported', 0x0D, 0x0A, '$'
 
 ; FCB template for A:$$$.SUB — copied into sub_fcb at each prompt
 sub_fcb_init:

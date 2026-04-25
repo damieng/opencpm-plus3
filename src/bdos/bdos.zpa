@@ -92,6 +92,12 @@ con_mode:   dw 0x0003          ; F109: console mode word (default: PAGE + DISPLA
                                ; bit 1 = DISPLAY (SETDEF [DISPLAY]/[NO DISPLAY])
 bdos_page_row: db 0            ; LFs output since last pause/input
 out_delim:  db '$'             ; F110: output delimiter (default '$')
+
+; Private SETDEF state (F120..F123). Not in the SCB — only reachable via
+; our own BDOS functions. Default: no search path (current drive only),
+; COM searched before SUB.
+bdos_search_path: db 0xFF, 0, 0, 0   ; 4 drive slots: 0=empty, 1..16=A..P, 0xFF='*'
+bdos_order:     db 0           ; 0=COM→SUB, 1=SUB→COM, 2=COM only, 3=SUB only
 ; Date/time fields are in the SCB (common.asm): scb_date, scb_minute, scb_sec
 
 ; Directory search state
@@ -267,6 +273,14 @@ bdos_entry:
     jp z, bf_f111
     cp 112
     jp z, bf_f112
+    cp 120
+    jp z, bf_f120
+    cp 121
+    jp z, bf_f121
+    cp 122
+    jp z, bf_f122
+    cp 123
+    jp z, bf_f123
 
     ; Unknown function
     pop de
@@ -1021,12 +1035,13 @@ bf_f37:
 ; ==========================================================================
 ; @proc select_drive
 ; @param %drive:u8  a
+; @out   carry
 ; @clobbers af,bc,de,hl
 ; @end
 ; Internal: select_drive — Log in a drive, cache its DPB parameters for
 ; subsequent file operations.
 ;   In:  A = drive number (0=A:, 1=B:, ...)
-;   Out: cached_* fields populated for this drive.
+;   Out: CF=0 on success (cached_* populated), CF=1 if drive not present.
 ;        cur_disk is NOT touched — this call is independent of the user's
 ;        default drive (FCB-drive overrides don't change A: to B:).
 ;   Clobbers: AF, BC, DE, HL
@@ -1761,6 +1776,7 @@ bf_f15:
 .has_drv:
     dec a                      ; A = 0-based drive
     call select_drive
+    jp c, .not_found           ; invalid drive → treat as "file not found"
 
     ; Search for the file in the directory
     pop de                     ; DE = fcb_buf
@@ -4260,6 +4276,111 @@ bf_f111:
 bf_f112:
     pop de
     pop bc
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F120: Get SETDEF order byte
+;   Out: A = bdos_order (0=COM→SUB, 1=SUB→COM, 2=COM only, 3=SUB only)
+; @proc bf_f120
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f120:
+    pop de
+    pop bc
+    ld a, (bdos_order)
+    ld l, a
+    ld h, 0
+    jp bdos_ret
+
+
+; F121: Set SETDEF order byte
+;   In: E = new order value
+;   Out: A = 0
+; @proc bf_f121
+; @param %param:u16 de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f121:
+    pop de
+    pop bc
+    ld a, e
+    ld (bdos_order), a
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F122: Get SETDEF search path
+;   In: DE = 4-byte TPA buffer to receive path
+;   Out: A = 0 (buffer written with 4 drive bytes)
+; @proc bf_f122
+; @param %buf:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f122:
+    pop de
+    pop bc
+    ld hl, bdos_search_path
+    ld b, 4
+.f122_loop:
+    push bc
+    push hl
+    push de
+    ld a, (hl)
+    call write_user_byte(a, de) preserving %func  ; byte → TPA[DE]
+    pop de
+    pop hl
+    pop bc
+    inc hl
+    inc de
+    djnz .f122_loop
+    xor a
+    ld l, a
+    ld h, a
+    jp bdos_ret
+
+
+; F123: Set SETDEF search path
+;   In: DE = 4-byte TPA buffer with new path
+;   Out: A = 0
+; @proc bf_f123
+; @param %buf:u16   de
+; @param %func:u8   c
+; @out   a
+; @out   hl
+; @clobbers af,bc,de,hl
+; @end
+bf_f123:
+    pop de
+    pop bc
+    ld hl, bdos_search_path
+    ld b, 4
+.f123_loop:
+    push bc
+    push hl
+    push de
+    call read_user_byte(de) preserving %func      ; A = TPA[DE]
+    pop de
+    pop hl
+    pop bc
+    ld (hl), a
+    inc hl
+    inc de
+    djnz .f123_loop
     xor a
     ld l, a
     ld h, a

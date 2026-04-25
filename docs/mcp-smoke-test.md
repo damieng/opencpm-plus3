@@ -79,15 +79,10 @@ Read `char_buffer` again and require:
 - output contains `0000:`
 - execution is not spinning in common-memory copy code
 
-For optional RAMDISK.FID coverage, rebuild with:
-
-```text
-build.cmd --add build\RAMDISK.FID
-```
-
-Repeat the same boot check and require `A>` again. This catches the common
-class of regressions where a FID/layout change assembles but corrupts boot,
-page-zero setup, BDOS stack, or the bank-4 system image.
+`RAMDISK.FID` is included in the default disk image, so the boot path
+already exercises `load_fid` on every build. Watch for `A>` to appear —
+if the boot hangs after `Open CP/M +3`, suspect a FID/layout regression
+in page-zero setup, the BDOS stack, or the bank-4 system image.
 
 ### 1. Boot and initial directory
 

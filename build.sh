@@ -88,6 +88,7 @@ python3 tools/mkdsk.py create build/cpm3.dsk \
     build/bdostest.com build/xtetest.com \
     build/disktest.com build/termtest.com \
     build/date.com build/showxdpb.com build/dump.com build/setdef.com \
+    build/RAMDISK.FID \
     references/binaries/*.COM references/binaries/*.SUB \
     $EXTRAFILES
 

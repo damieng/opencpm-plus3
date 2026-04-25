@@ -580,7 +580,7 @@ print_str:
     inc %str
     jr print_str
 
-BUILD_NUM equ 155
+BUILD_NUM equ 157
 
 TPA_KB equ (bdos_stub - 0x0100) / 1024
 

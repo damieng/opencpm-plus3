@@ -758,6 +758,29 @@ parse_cmd:
     ret
 
 .com_opened:
+    ; Peek at the first byte of the file to spot a CP/M 3 PRL/RSX prefix
+    ; (file starts with 0xC9 RET — see the loader plan). PRL files have a
+    ; 256-byte header that we have to skip and a relocation bitmap to apply,
+    ; which is a separate path from the classic "raw bytes at 0x0100" load.
+    ld de, ccp_prl_header
+    ld c, 26                   ; F26: Set DMA
+    call BDOS
+    ld de, type_fcb
+    ld c, 20                   ; F20: Read Sequential
+    call BDOS
+    ; Reopen so the rest of the load reads from record 0 again.
+    ld de, type_fcb
+    ld c, 16                   ; F16: Close File
+    call BDOS
+    ld de, type_fcb
+    ld c, 15                   ; F15: Open File
+    call BDOS
+    cp 0xFF
+    jp z, .com_unknown         ; should not happen — file just opened cleanly
+
+    ld a, (ccp_prl_header)
+    cp 0xC9
+    jp z, .com_load_prl
 
     ; (Command tail is set up after FCB parsing, so clear_fcb_de
     ; on FCB2 at 006Ch doesn't clobber the tail at 0080h.)
@@ -963,6 +986,24 @@ parse_cmd:
     ld de, msg_unknown
     ld c, F_PSTR
     call BDOS
+    ret
+
+
+; ==========================================================================
+; .com_load_prl — Load a CP/M 3 PRL/RSX-prefixed transient program.
+;   On entry: type_fcb describes a freshly-opened PRL file (record 0).
+;             ccp_prl_header[0..127] holds the first 128 bytes of the file
+;             (the RSX prefix is in bytes 0..7, code length at 0x01-0x02,
+;             BSS length at 0x05-0x06).
+;   For now: not yet implemented — surface a clean message and exit so
+;   the ORDER dispatcher's trailing "?" doesn't fire (same trick as the
+;   .SUB-found path — pop the dispatcher's return address).
+; ==========================================================================
+.com_load_prl:
+    ld de, msg_prl_unsupported
+    ld c, F_PSTR
+    call BDOS
+    pop hl                     ; discard ORDER-dispatcher return
     ret
 
 
@@ -1597,6 +1638,15 @@ ccp_search_buf:
 ; Surfaced when CCP finds a .SUB but can't run it (no RSX loader yet).
 msg_sub_unsupported:
     db 'SUBMIT chaining not yet supported', 0x0D, 0x0A, '$'
+
+; Surfaced when CCP detects a PRL/RSX-prefixed .COM (first byte 0xC9).
+msg_prl_unsupported:
+    db 'PRL/RSX load not yet supported', 0x0D, 0x0A, '$'
+
+; First 128 bytes of a PRL file's header — used to spot the 0xC9 prefix
+; and grab code_length / bss_length without burning a permanent buffer.
+ccp_prl_header:
+    ds 128
 
 ; FCB template for A:$$$.SUB — copied into sub_fcb at each prompt
 sub_fcb_init:

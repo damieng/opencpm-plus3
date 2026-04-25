@@ -63,6 +63,34 @@ ccp_start:
     call BDOS
 
 .prompt:
+    call try_sub
+    jr c, .read_console
+
+    call print_prompt
+    ld de, 0xFFFF
+    ld c, F_CONMODE
+    call BDOS                  ; HL = con_mode
+    ld a, l
+    and CON_MODE_DISPLAY
+    call nz, echo_sub_line
+    jr .got_line
+
+.read_console:
+    call print_prompt
+    ; Read command line
+    ld de, cmd_buf
+    ld c, F_RDBUF
+    call BDOS
+
+.got_line:
+    ; Parse and execute
+    call parse_cmd
+    jr .prompt
+
+; @proc print_prompt
+; @clobbers af,bc,de,hl
+; @end
+print_prompt:
     ; Prompt: CRLF + drive letter (from BDOS) + '>'
     ld c, 25                   ; F25: Return Current Disk
     call BDOS                  ; A = current drive (0-15)
@@ -81,22 +109,7 @@ ccp_start:
     call BDOS
     ld e, '>'
     ld c, F_COUT
-    call BDOS
-
-    ; If A:$$$.SUB is active, pull the next line from it (and echo it).
-    ; Otherwise read from the console.
-    call try_sub
-    jr nc, .got_line
-
-    ; Read command line
-    ld de, cmd_buf
-    ld c, F_RDBUF
-    call BDOS
-
-.got_line:
-    ; Parse and execute
-    call parse_cmd
-    jr .prompt
+    jp BDOS
 
 
 ; ==========================================================================
@@ -1350,7 +1363,7 @@ try_sub:
     ld c, F_CONMODE
     call BDOS                  ; HL = con_mode
     ld a, l
-    and CON_MODE_DISPLAY
+    xor a
     call nz, echo_sub_line     ; DISPLAY on → echo the SUB line
     xor a                      ; CF=0 → cmd_buf is loaded
     ret

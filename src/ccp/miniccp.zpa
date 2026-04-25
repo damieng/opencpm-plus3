@@ -706,42 +706,155 @@ parse_cmd:
     ; parse_cmd so the regular load path runs SUBMIT.COM (which the PRL
     ; loader now handles). SUBMIT will create A:$$$.SUB and the prompt
     ; loop's existing $$$.SUB drain takes over from there.
+    xor a
+    ld (ccp_chain_drive), a
+    ld (ccp_chain_skip), a
+    ld a, (type_fcb)
+    or a
+    jr z, .com_chain_len
+    ld (ccp_chain_drive), a
+    call .com_chain_has_drive
+    jr nc, .com_chain_len
+    xor a
+    ld (ccp_chain_drive), a
+.com_chain_len:
+    ld a, (ccp_chain_drive)
+    or a
+    call nz, .com_chain_count_spaces
     ld a, (cmd_buf + 1)
+    ld b, a
+    ld a, (ccp_chain_skip)
+    ld c, a
+    ld a, b
+    sub c
     add a, 7                   ; "SUBMIT " adds 7 chars
+    ld b, a
+    ld a, (ccp_chain_drive)
+    or a
+    ld a, b
+    jr z, .com_chain_len_ready
+    add a, 2                   ; injected "X:"
+.com_chain_len_ready:
     cp 127
     jp nc, .com_unknown        ; rewritten command wouldn't fit
     push af                    ; save new length
 
-    ; scratch ← original command text
+    ; Move the original command text up in-place. LDDR is safe here because
+    ; the destination is higher than the source. If a drive prefix is being
+    ; injected, leading spaces are trimmed so the tail becomes "X:NAME".
     ld a, (cmd_buf + 1)
+    ld b, a
+    ld a, (ccp_chain_skip)
+    ld c, a
+    ld a, b
+    sub c
     or a
-    jr z, .com_chain_no_orig
+    jr z, .com_chain_no_orig_shift
     ld c, a
     ld b, 0
     ld hl, cmd_buf + 2
-    ld de, ccp_chain_scratch
-    ldir
-.com_chain_no_orig:
+    ld a, (ccp_chain_skip)
+    add a, l
+    ld l, a
+    jr nc, .com_chain_src_start
+    inc h
+.com_chain_src_start:
+    ld de, cmd_buf + 9
+    ld a, (ccp_chain_drive)
+    or a
+    jr z, .com_chain_dst_start
+    inc de
+    inc de
+.com_chain_dst_start:
+    push bc
+    dec bc
+    add hl, bc
+    ex de, hl
+    add hl, bc
+    ex de, hl
+    pop bc
+    lddr
+.com_chain_no_orig_shift:
 
-    ; cmd_buf+2 ← "SUBMIT "
+    ; cmd_buf+2 ← "SUBMIT " plus optional matched-drive prefix.
     ld hl, str_submit_prefix
     ld de, cmd_buf + 2
     ld bc, 7
     ldir
 
-    ; cmd_buf+9 ← scratch (DE is already cmd_buf+9 after the LDIR above)
-    ld a, (cmd_buf + 1)
+    ld a, (ccp_chain_drive)
     or a
-    jr z, .com_chain_no_orig_back
-    ld c, a
-    ld b, 0
-    ld hl, ccp_chain_scratch
-    ldir
-.com_chain_no_orig_back:
+    jr z, .com_chain_no_drive_back
+    add a, 'A' - 1
+    ld (de), a
+    inc de
+    ld a, ':'
+    ld (de), a
+    inc de
+.com_chain_no_drive_back:
     pop af
     ld (cmd_buf + 1), a
     pop hl                     ; discard ORDER-dispatcher return
     jp parse_cmd
+
+; .com_chain_has_drive — Check whether the original command already starts
+;   with an explicit A:..P: drive after any leading spaces.
+;   Out: CF=1 if a drive prefix is already present, CF=0 otherwise.
+.com_chain_has_drive:
+    ld hl, cmd_buf + 2
+    ld a, (cmd_buf + 1)
+    ld b, a
+.chd_skip:
+    ld a, b
+    or a
+    jr z, .chd_no
+    ld a, (hl)
+    cp ' '
+    jr nz, .chd_check
+    inc hl
+    djnz .chd_skip
+.chd_no:
+    or a
+    ret
+.chd_check:
+    ld a, b
+    cp 2
+    jr c, .chd_no
+    ld a, (hl)
+    call to_upper
+    cp 'A'
+    jr c, .chd_no
+    cp 'P' + 1
+    jr nc, .chd_no
+    inc hl
+    ld a, (hl)
+    cp ':'
+    jr nz, .chd_no
+    scf
+    ret
+
+; .com_chain_count_spaces — Count leading spaces in cmd_buf for the SUBMIT
+;   rewrite. Used only when injecting a matched search-path drive.
+;   Out: ccp_chain_skip = count of leading spaces.
+.com_chain_count_spaces:
+    ld hl, cmd_buf + 2
+    ld a, (cmd_buf + 1)
+    ld b, a
+    ld c, 0
+.ccs_loop:
+    ld a, b
+    or a
+    jr z, .ccs_done
+    ld a, (hl)
+    cp ' '
+    jr nz, .ccs_done
+    inc hl
+    inc c
+    djnz .ccs_loop
+.ccs_done:
+    ld a, c
+    ld (ccp_chain_skip), a
+    ret
 
 .com_clear_fcb_tail:
     ld hl, type_fcb + 12
@@ -801,11 +914,20 @@ parse_cmd:
     ld de, type_fcb
     ld c, 20                   ; F20: Read Sequential — consume record 0
     call BDOS
+    or a
+    jr nz, .com_reopen_classic
 
     ld a, (ccp_prl_header)
     cp 0xC9
+    jr nz, .com_reopen_classic
+    ld a, (ccp_prl_header + 1)
+    or a
+    jr nz, .com_reopen_classic
+    ld a, (ccp_prl_header + 3)
+    cp 0xC9
     jr z, .com_opened_prl
 
+.com_reopen_classic:
     ; Classic .COM — rewind so the loader reads from record 0 again.
     ld de, type_fcb
     ld c, 16                   ; F16: Close File
@@ -827,6 +949,8 @@ parse_cmd:
     ld de, type_fcb
     ld c, 20
     call BDOS
+    or a
+    jp nz, .com_unknown
 
     ; (Command tail is set up after FCB parsing, so clear_fcb_de
     ; on FCB2 at 006Ch doesn't clobber the tail at 0080h.)
@@ -1669,9 +1793,10 @@ ccp_search_buf:
 str_submit_prefix:
     db 'SUBMIT '
 
-; Scratch space used while rewriting cmd_buf for the SUBMIT chain.
-ccp_chain_scratch:
-    ds 128
+ccp_chain_drive:
+    db 0
+ccp_chain_skip:
+    db 0
 
 ; First 128 bytes of a PRL file's header — used to spot the 0xC9 prefix
 ; before deciding how many records to skip in the loader.

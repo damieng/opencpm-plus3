@@ -702,16 +702,46 @@ parse_cmd:
     call .com_clear_fcb_tail
     call .com_walk_path
     ret nc
-    ; Found a .SUB hit. Real CP/M 3 would chain to SUBMIT.COM here, but
-    ; the reference SUBMIT.COM is an RSX (header begins C9 00 nn C9) and
-    ; our loader doesn't yet handle that format. Surface a clear message
-    ; and return all the way out (skipping the `jp .com_unknown` that the
-    ; ORDER dispatcher would otherwise hit, which would print a stray "?").
-    ld de, msg_sub_unsupported
-    ld c, 9                    ; F9: Print String
-    call BDOS
+    ; Found a .SUB hit. Rewrite cmd_buf as "SUBMIT <orig>" and re-enter
+    ; parse_cmd so the regular load path runs SUBMIT.COM (which the PRL
+    ; loader now handles). SUBMIT will create A:$$$.SUB and the prompt
+    ; loop's existing $$$.SUB drain takes over from there.
+    ld a, (cmd_buf + 1)
+    add a, 7                   ; "SUBMIT " adds 7 chars
+    cp 127
+    jp nc, .com_unknown        ; rewritten command wouldn't fit
+    push af                    ; save new length
+
+    ; scratch ← original command text
+    ld a, (cmd_buf + 1)
+    or a
+    jr z, .com_chain_no_orig
+    ld c, a
+    ld b, 0
+    ld hl, cmd_buf + 2
+    ld de, ccp_chain_scratch
+    ldir
+.com_chain_no_orig:
+
+    ; cmd_buf+2 ← "SUBMIT "
+    ld hl, str_submit_prefix
+    ld de, cmd_buf + 2
+    ld bc, 7
+    ldir
+
+    ; cmd_buf+9 ← scratch (DE is already cmd_buf+9 after the LDIR above)
+    ld a, (cmd_buf + 1)
+    or a
+    jr z, .com_chain_no_orig_back
+    ld c, a
+    ld b, 0
+    ld hl, ccp_chain_scratch
+    ldir
+.com_chain_no_orig_back:
+    pop af
+    ld (cmd_buf + 1), a
     pop hl                     ; discard ORDER-dispatcher return
-    ret                        ; return to parse_cmd's caller
+    jp parse_cmd
 
 .com_clear_fcb_tail:
     ld hl, type_fcb + 12
@@ -1634,9 +1664,14 @@ dir_fcb:
 ccp_search_buf:
     ds 4
 
-; Surfaced when CCP finds a .SUB but can't run it (no RSX loader yet).
-msg_sub_unsupported:
-    db 'SUBMIT chaining not yet supported', 0x0D, 0x0A, '$'
+; "SUBMIT " prefix prepended to cmd_buf when CCP chains a .SUB hit
+; through SUBMIT.COM.
+str_submit_prefix:
+    db 'SUBMIT '
+
+; Scratch space used while rewriting cmd_buf for the SUBMIT chain.
+ccp_chain_scratch:
+    ds 128
 
 ; First 128 bytes of a PRL file's header — used to spot the 0xC9 prefix
 ; before deciding how many records to skip in the loader.
